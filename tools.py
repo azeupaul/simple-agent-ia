@@ -1,7 +1,7 @@
 """Tools the agent can ask the model to call."""
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, ClassVar
 
 from google.genai import types
 
@@ -19,9 +19,16 @@ class Tool(ABC):
             decide which arguments to send.
     """
 
-    name: str
-    description: str
-    parameters: dict[str, Any]
+    name: ClassVar[str]
+    description: ClassVar[str]
+    parameters: ClassVar[dict[str, Any]]
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Check that subclasses define the required class attributes."""
+        super().__init_subclass__(**kwargs)
+        for attr in ("name", "description", "parameters"):
+            if not getattr(cls, attr, None):
+                raise TypeError(f"{cls.__name__} must define a non-empty '{attr}'")
 
     @abstractmethod
     def run(self, **kwargs: Any) -> Any:
