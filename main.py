@@ -4,7 +4,7 @@ EXIT_COMMANDS = {"quit", "exit", "q"}
 
 def main():
     print("Welcome to simple agent... [type quit, exit or q to exit the program]")
-    
+
     while True:
         try:
             user_input = input("You: ").strip()
