@@ -1,9 +1,27 @@
-from agent import call_agent
+"""Command-line chat with the agent."""
 
-EXIT_COMMANDS = {"quit", "exit", "q"}
+import os
 
-def main():
-    print("Welcome to simple agent... [type quit, exit or q to exit the program]")
+from dotenv import load_dotenv
+from google import genai
+
+from agent import Agent
+
+EXIT_COMMANDS = {"/quit", "/exit"}
+RESET_COMMAND = "/reset"
+
+
+def main() -> None:
+    """Run an interactive chat session with the agent in the terminal."""
+    load_dotenv()
+
+    agent = Agent(
+        client=genai.Client(),
+        model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+    )
+
+    print("Welcome to simple agent!")
+    print("Commands: /reset to start a new conversation, /quit or /exit to leave.")
 
     while True:
         try:
@@ -15,11 +33,18 @@ def main():
         if not user_input:
             continue
 
-        if user_input.lower() in EXIT_COMMANDS:
+        command = user_input.lower()
+
+        if command in EXIT_COMMANDS:
             break
 
+        if command == RESET_COMMAND:
+            agent.reset()
+            print("[conversation reset]")
+            continue
+
         try:
-            response = call_agent(user_prompt=user_input)
+            response = agent.chat(user_prompt=user_input)
         except KeyboardInterrupt:
             print("\n[request cancelled]")
             continue
