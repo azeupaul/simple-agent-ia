@@ -1,7 +1,11 @@
 """Conversational agent backed by a Gemini model."""
 
+from collections.abc import Sequence
+
 from google import genai
 from google.genai import types
+
+from tools import Tool
 
 
 class Agent:
@@ -19,6 +23,7 @@ class Agent:
         *,
         model: str,
         system_instruction: str = DEFAULT_SYSTEM_INSTRUCTION,
+        tools: Sequence[Tool] = (),
     ) -> None:
         """Initialize the agent with an empty conversation.
 
@@ -26,13 +31,22 @@ class Agent:
             client: The Gemini client used to send requests.
             model: The name of the Gemini model, e.g. "gemini-3.5-flash-lite".
             system_instruction: The instruction that frames the model's behavior.
+            tools: Optional sequence of tools that the agent can use to answer
+                questions.
         """
         self._client = client
         self._model = model
+        declared_tools = (
+            [types.Tool(function_declarations=[tool.declaration for tool in tools])]
+            if tools
+            else None
+        )
         self._config = types.GenerateContentConfig(
             system_instruction=system_instruction,
+            tools=declared_tools,
         )
         self._history: list[types.Content] = []
+        self._tools = {tool.name: tool for tool in tools}
 
     @property
     def history(self) -> tuple[types.Content, ...]:
@@ -74,6 +88,11 @@ class Agent:
             raise RuntimeError(
                 "Gemini returned no candidates (response may have been blocked)"
             )
+
+        if response.function_calls:
+            for call in response.function_calls:
+                print(f"[model requests] {call.name}({call.args})")
+            return ""
 
         self._history.extend([user_content, response.candidates[0].content])
 
