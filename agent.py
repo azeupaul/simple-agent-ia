@@ -15,7 +15,14 @@ class Agent:
     remembers previous turns until `reset` is called.
     """
 
-    DEFAULT_SYSTEM_INSTRUCTION = "Tu es un assistant qui aide à résoudre des problèmes."
+    DEFAULT_SYSTEM_INSTRUCTION = (
+        "You are an assistant that helps users solve problems.\n"
+        "Always reply in the language of the user's latest message.\n"
+        "Use the available tools whenever they can provide information you do "
+        "not have, such as the current date or time.\n"
+        "Never make up real-time or live information. If no tool can provide "
+        "it, say plainly that you cannot know it."
+    )
 
     def __init__(
         self,
