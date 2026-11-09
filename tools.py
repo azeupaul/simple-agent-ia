@@ -41,6 +41,10 @@ class Tool(ABC):
 
         Returns:
             The result sent back to the model. It must be JSON-serializable.
+
+        Raises:
+            Exception: If the tool fails. The agent will catch it and send
+                an error message back to the model.
         """
 
     @property

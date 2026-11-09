@@ -36,14 +36,11 @@ class Agent:
         """
         self._client = client
         self._model = model
-        declared_tools = (
-            [types.Tool(function_declarations=[tool.declaration for tool in tools])]
-            if tools
-            else None
-        )
         self._config = types.GenerateContentConfig(
             system_instruction=system_instruction,
-            tools=declared_tools,
+            tools=[types.Tool(function_declarations=[t.declaration for t in tools])]
+            if tools
+            else None,
         )
         self._history: list[types.Content] = []
         self._tools = {tool.name: tool for tool in tools}
@@ -56,23 +53,57 @@ class Agent:
     def chat(self, user_prompt: str) -> str:
         """Send a message to the model and return its reply.
 
-        The message and the reply are added to the history only if the request
-        succeeds, so a failed or cancelled request leaves the history unchanged.
+        If the model requests tools, the agent runs them, sends their results
+        back, and returns the model's final answer. Only one round of tool
+        calls is supported for now.
+
+        The whole turn (the message, any tool calls and results, and the reply)
+        is added to the history only if it completes, so a failed or cancelled
+        turn leaves the history unchanged.
 
         Args:
             user_prompt: The user's message.
 
         Returns:
-            The text of the model's reply (empty if the reply has no text).
+            The text of the model's final reply (empty if it has no text).
 
         Raises:
-            RuntimeError: If the request fails or Gemini returns no candidates.
+            RuntimeError: If a request fails, Gemini returns no candidates, or
+                the model requests tools again after receiving their results.
         """
         user_content = types.Content(
             role="user", parts=[types.Part.from_text(text=user_prompt)]
         )
-        contents = [*self._history, user_content]
 
+        turn: list[types.Content] = [user_content]
+
+        model_content = self._generate([*self._history, *turn])
+        turn.append(model_content)
+
+        function_calls = self._function_calls(model_content)
+        if function_calls:
+            tools_responses = [self._run_tool(call) for call in function_calls]
+            tool_content = types.Content(
+                role="user",
+                parts=tools_responses,
+            )
+            turn.append(tool_content)
+
+            model_content = self._generate([*self._history, *turn])
+            if self._function_calls(model_content):
+                raise RuntimeError("The model requested tools again; not supported yet")
+            turn.append(model_content)
+
+        self._history.extend(turn)
+
+        return self._text(model_content)
+
+    def reset(self) -> None:
+        """Start a new conversation by clearing the history."""
+        self._history.clear()
+
+    def _generate(self, contents: list[types.Content]) -> types.Content:
+        """Send contents to the model and return the model's response."""
         try:
             response = self._client.models.generate_content(
                 model=self._model,
@@ -89,15 +120,44 @@ class Agent:
                 "Gemini returned no candidates (response may have been blocked)"
             )
 
-        if response.function_calls:
-            for call in response.function_calls:
-                print(f"[model requests] {call.name}({call.args})")
-            return ""
+        return response.candidates[0].content
 
-        self._history.extend([user_content, response.candidates[0].content])
+    def _run_tool(self, call: types.FunctionCall) -> types.Part:
+        """Run a tool requested by the model.
 
-        return response.text or ""
+        This method never raises: an unknown tool or an exception raised by the
+        tool is reported to the model as an error, so it can react to it.
 
-    def reset(self) -> None:
-        """Start a new conversation by clearing the history."""
-        self._history.clear()
+        Args:
+            call: The function call requested by the model.
+
+        Returns:
+            A function response part containing either a "result" or an "error".
+        """
+        name = call.name or ""
+        tool = self._tools.get(name)
+
+        if tool is None:
+            response = {
+                "error": f"Unknown tool '{name}'. Available tools: {list(self._tools)}"
+            }
+        else:
+            try:
+                tool_response = tool.run(**(call.args or {}))
+                response = {"result": tool_response}
+            except Exception as error:
+                response = {"error": f"Tool request failed: {error!r}"}
+
+        return types.Part.from_function_response(name=name, response=response)
+
+    @staticmethod
+    def _function_calls(content: types.Content) -> list[types.FunctionCall]:
+        """Return the function calls requested in a model message."""
+        return [
+            part.function_call for part in content.parts or [] if part.function_call
+        ]
+
+    @staticmethod
+    def _text(content: types.Content) -> str:
+        """Return the concatenated text parts of a model message."""
+        return "".join(part.text for part in content.parts or [] if part.text)
