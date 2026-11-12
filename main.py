@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from google import genai
 
 from agent import Agent
-from tools import GetCurrentTimeTool
+from tools import CalculateTool, GetCurrentTimeTool
 
 EXIT_COMMANDS = {"/quit", "/exit"}
 RESET_COMMAND = "/reset"
@@ -19,7 +19,7 @@ def main() -> None:
     agent = Agent(
         client=genai.Client(),
         model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-        tools=[GetCurrentTimeTool()],
+        tools=[CalculateTool(), GetCurrentTimeTool()],
     )
 
     print("Welcome to simple agent!")
