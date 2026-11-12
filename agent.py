@@ -24,6 +24,8 @@ class Agent:
         "it, say plainly that you cannot know it."
     )
 
+    DEFAULT_MAX_ITERATIONS = 10
+
     def __init__(
         self,
         client: genai.Client,
@@ -31,6 +33,7 @@ class Agent:
         model: str,
         system_instruction: str = DEFAULT_SYSTEM_INSTRUCTION,
         tools: Sequence[Tool] = (),
+        max_iterations: int = DEFAULT_MAX_ITERATIONS,
     ) -> None:
         """Initialize the agent with an empty conversation.
 
@@ -40,7 +43,14 @@ class Agent:
             system_instruction: The instruction that frames the model's behavior.
             tools: Optional sequence of tools that the agent can use to answer
                 questions.
+            max_iterations: Maximum number of model calls in a single turn.
+
+        Raises:
+            ValueError: If max_iterations is less than 1.
         """
+        if max_iterations < 1:
+            raise ValueError(f"max_iterations must be at least 1, got {max_iterations}")
+
         self._client = client
         self._model = model
         self._config = types.GenerateContentConfig(
@@ -51,6 +61,7 @@ class Agent:
         )
         self._history: list[types.Content] = []
         self._tools = {tool.name: tool for tool in tools}
+        self._max_iterations = max_iterations
 
     @property
     def history(self) -> tuple[types.Content, ...]:
@@ -61,8 +72,7 @@ class Agent:
         """Send a message to the model and return its reply.
 
         If the model requests tools, the agent runs them, sends their results
-        back, and returns the model's final answer. Only one round of tool
-        calls is supported for now.
+        back, and returns the model's final answer.
 
         The whole turn (the message, any tool calls and results, and the reply)
         is added to the history only if it completes, so a failed or cancelled
@@ -76,7 +86,7 @@ class Agent:
 
         Raises:
             RuntimeError: If a request fails, Gemini returns no candidates, or
-                the model requests tools again after receiving their results.
+                the model still requests tools after max_iterations calls.
         """
         user_content = types.Content(
             role="user", parts=[types.Part.from_text(text=user_prompt)]
@@ -84,26 +94,28 @@ class Agent:
 
         turn: list[types.Content] = [user_content]
 
-        model_content = self._generate([*self._history, *turn])
-        turn.append(model_content)
-
-        function_calls = self._function_calls(model_content)
-        if function_calls:
-            tools_responses = [self._run_tool(call) for call in function_calls]
-            tool_content = types.Content(
-                role="user",
-                parts=tools_responses,
-            )
-            turn.append(tool_content)
-
+        for _ in range(self._max_iterations):
             model_content = self._generate([*self._history, *turn])
-            if self._function_calls(model_content):
-                raise RuntimeError("The model requested tools again; not supported yet")
             turn.append(model_content)
 
-        self._history.extend(turn)
+            function_calls = self._function_calls(model_content)
+            if not function_calls:
+                self._history.extend(turn)
+                return self._text(model_content)
 
-        return self._text(model_content)
+            tools_responses = [self._run_tool(call) for call in function_calls]
+
+            turn.append(
+                types.Content(
+                    role="user",
+                    parts=tools_responses,
+                )
+            )
+
+        raise RuntimeError(
+            f"No final answer within the {self._max_iterations}-call limit: "
+            "the model kept requesting tools"
+        )
 
     def reset(self) -> None:
         """Start a new conversation by clearing the history."""

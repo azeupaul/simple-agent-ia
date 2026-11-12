@@ -93,7 +93,7 @@ The checks are `ruff format`, `ruff check` and `mypy` in strict mode. GitHub Act
 
 - [x] Conversation memory and terminal chat
 - [x] Tools with manual function calling
-- [ ] Agent loop: chain several tool calls, with a maximum number of iterations
+- [x] Agent loop: chain several tool calls, with a maximum number of iterations
 - [ ] Tool registry
 - [ ] Tracing and human confirmation for sensitive tools
 - [ ] Going further: history summarization, planning, structured output, streaming
