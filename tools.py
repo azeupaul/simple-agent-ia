@@ -101,15 +101,23 @@ class CalculateTool(Tool):
 
     name = "calculate"
     description = (
-        "Evaluate a mathematical expression and return the result. "
-        "Use it whenever the user asks you to calculate something."
+        "Evaluate an arithmetic expression and return the exact result. "
+        "Always use it instead of calculating in your head, especially with "
+        "large or decimal numbers. "
+        "Supported: numbers, + - * / // % ** and parentheses. "
+        "Not supported: functions (sqrt, round...), variables, dates or times. "
+        "Use x ** 0.5 for a square root, and convert times to minutes or "
+        "seconds before calculating."
     )
     parameters: ClassVar[dict[str, Any]] = {
         "type": "object",
         "properties": {
             "expression": {
                 "type": "string",
-                "description": "A mathematical expression, e.g. '2 + 2 * 3'",
+                "description": (
+                    "Arithmetic expression in Python syntax, e.g. "
+                    "'(24 * 60 - 935) / 60'. Use ** for powers, not ^."
+                ),
             }
         },
         "required": ["expression"],
