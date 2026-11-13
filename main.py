@@ -4,12 +4,31 @@ import os
 
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 
 from agent import Agent
 from tools import CalculateTool, GetCurrentTimeTool
 
 EXIT_COMMANDS = {"/quit", "/exit"}
 RESET_COMMAND = "/reset"
+HISTORY_COMMAND = "/history"
+MAX_DISPLAY_LENGTH = 80
+
+
+def format_part(role: str | None, part: types.Part) -> str:
+    """Return a one-line, human-readable summary of a message part."""
+    if part.text:
+        text = part.text.replace("\n", " ")
+        if len(text) > MAX_DISPLAY_LENGTH:
+            text = text[: MAX_DISPLAY_LENGTH - 1] + "…"
+        return f"[{role} text]: {text}"
+    if part.function_call:
+        call = part.function_call
+        return f"[{role} call]: {call.name}({call.args})"
+    if part.function_response:
+        result = part.function_response
+        return f"[{role} result]: {result.name} -> {result.response}"
+    return f"[{role} unknown part]"
 
 
 def main() -> None:
@@ -23,7 +42,11 @@ def main() -> None:
     )
 
     print("Welcome to simple agent!")
-    print("Commands: /reset to start a new conversation, /quit or /exit to leave.")
+    print("Available Commands:")
+    print(" - /reset to start a new conversation")
+    print(" - /quit or /exit to end the session")
+    print(" - /history to view the conversation history")
+    print("Type your message and press Enter to send it.\n")
 
     while True:
         try:
@@ -43,6 +66,15 @@ def main() -> None:
         if command == RESET_COMMAND:
             agent.reset()
             print("[conversation reset]")
+            continue
+
+        if command == HISTORY_COMMAND:
+            if not agent.history:
+                print("[no conversation history]")
+            else:
+                for content in agent.history:
+                    for part in content.parts or []:
+                        print(format_part(content.role, part))
             continue
 
         try:
