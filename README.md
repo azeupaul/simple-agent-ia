@@ -7,20 +7,30 @@ A learning project to understand how an AI agent works by building one **without
 - Interactive chat in the terminal
 - Conversation memory: the whole history is sent to the model on each turn
 - Tool calling, handled manually: the model requests a tool, the agent runs it and sends the result back
+- Agent loop: the model can chain several tool calls in one turn, up to a maximum number of iterations
 - Parallel tool calls in a single response
-- Tool errors are reported to the model instead of crashing the agent
+- Tool errors are reported to the model, which can correct itself and retry
+- Conversation inspection with `/history`
+
+### Available tools
+
+| Tool | Description |
+|---|---|
+| `get_current_time` | Current date and time in a given IANA timezone |
+| `calculate` | Arithmetic evaluator (`+ - * / // % **`, parentheses). It parses the expression with `ast` and never calls `eval`, and it rejects results that would be too large to compute or send back. |
 
 ## How it works
 
 ```
-user   → "What time is it in Paris and Tokyo?"
-model  → function_call get_current_time(timezone="Europe/Paris")
-         function_call get_current_time(timezone="Asia/Tokyo")
-agent  → runs both tools, sends back the two function responses
-model  → "It is 01:08 in Paris and 09:08 in Tokyo."
+user   → "How many hours are left before midnight in Tokyo?"
+model  → function_call get_current_time(timezone="Asia/Tokyo")
+agent  → runs it, sends back "2026-11-13T09:03:59+09:00"
+model  → function_call calculate(expression="24 - (9 + 3 / 60)")
+agent  → runs it, sends back 14.95
+model  → "About 14 hours and 57 minutes."
 ```
 
-The model never runs anything itself: it only **requests** a tool, based on the tool's name, description and JSON Schema. The agent executes it.
+The model never runs anything itself: it only **requests** a tool, based on the tool's name, description and JSON Schema. The agent executes it, sends the result back, and loops until the model answers with text. `max_iterations` (10 by default) caps the number of model calls in a turn.
 
 | File | Role |
 |---|---|
@@ -51,6 +61,7 @@ uv run main.py
 
 | Command | Action |
 |---|---|
+| `/history` | Show the conversation, including tool calls and results |
 | `/reset` | Start a new conversation |
 | `/quit`, `/exit`, `Ctrl+D` | Leave |
 | `Ctrl+C` | Cancel the current request, or leave at the prompt |
@@ -76,9 +87,13 @@ class MyTool(Tool):
         return kwargs["arg"]
 ```
 
-Then register it in `main.py`: `Agent(..., tools=[GetCurrentTimeTool(), MyTool()])`.
+Then register it in `main.py`: `Agent(..., tools=[CalculateTool(), GetCurrentTimeTool(), MyTool()])`.
 
-The `description` is a prompt: it is the only thing the model reads to decide when to use the tool.
+The `description` is a prompt: it is the only thing the model reads to decide when to use the tool. Say what the tool accepts and what it does not, so the model does not waste iterations on rejected calls.
+
+Treat the arguments as untrusted input: they come from the model, which can be manipulated. Validate them, and never pass them to `eval`, a shell or a file path without checks.
+
+If `run` raises an exception, the agent catches it and sends the error message to the model.
 
 ## Development
 
