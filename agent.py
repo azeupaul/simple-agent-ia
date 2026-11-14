@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from google import genai
 from google.genai import types
 
-from tools import Tool
+from tools import Tool, ToolRegistry
 
 
 class Agent:
@@ -53,14 +53,14 @@ class Agent:
 
         self._client = client
         self._model = model
+        self._tools = ToolRegistry(tools)
         self._config = types.GenerateContentConfig(
             system_instruction=system_instruction,
-            tools=[types.Tool(function_declarations=[t.declaration for t in tools])]
-            if tools
+            tools=[types.Tool(function_declarations=self._tools.declarations)]
+            if self._tools
             else None,
         )
         self._history: list[types.Content] = []
-        self._tools = {tool.name: tool for tool in tools}
         self._max_iterations = max_iterations
 
     @property
@@ -158,7 +158,7 @@ class Agent:
 
         if tool is None:
             response = {
-                "error": f"Unknown tool '{name}'. Available tools: {list(self._tools)}"
+                "error": f"Unknown tool '{name}'. Available tools: {self._tools.names}"
             }
         else:
             try:

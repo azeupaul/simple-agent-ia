@@ -4,7 +4,7 @@ import ast
 import math
 import operator
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime
 from typing import Any, ClassVar
 from zoneinfo import ZoneInfo
@@ -210,3 +210,54 @@ class CalculateTool(Tool):
             return binary_op(left, right)
 
         raise ValueError(f"Unsupported expression: {ast.unparse(node)!r}")
+
+
+class ToolRegistry:
+    """A collection of tools, indexed by name."""
+
+    def __init__(self, tools: Iterable[Tool] = ()) -> None:
+        """Initialize the registry with the given tools.
+
+        Args:
+            tools: The list of tools to register.
+        """
+        self._tools: dict[str, Tool] = {}
+
+        for tool in tools:
+            self.register(tool)
+
+    def register(self, tool: Tool) -> None:
+        """Register a tool.
+
+        Args:
+            tool: Tools to register.
+
+        Raises:
+            ValueError: If a tool with same name already exists.
+        """
+        if tool.name in self._tools:
+            raise ValueError(f"A tool named {tool.name!r} is already registered")
+
+        self._tools[tool.name] = tool
+
+    def get(self, name: str) -> Tool | None:
+        """Return the tool with this name, or None if there is none."""
+        return self._tools.get(name)
+
+    @property
+    def names(self) -> list[str]:
+        """The names of the registered tools."""
+        return list(self._tools)
+
+    @property
+    def declarations(self) -> list[types.FunctionDeclaration]:
+        """The declarations of the registered tools."""
+        return [item.declaration for item in self._tools.values()]
+
+    def __len__(self) -> int:
+        """Count all registered tools.
+
+        Returns:
+            The number of tools in the registry.
+        """
+        return len(self._tools)
