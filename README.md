@@ -35,7 +35,7 @@ The model never runs anything itself: it only **requests** a tool, based on the 
 | File | Role |
 |---|---|
 | `agent.py` | `Agent`: keeps the history, calls Gemini, runs the requested tools |
-| `tools.py` | `Tool` abstract base class and the concrete tools |
+| `tools.py` | `Tool` base class, `@tool` decorator, `ToolRegistry` and the concrete tools |
 | `main.py` | Configuration and the terminal chat loop |
 
 A turn is committed to the history only once it completes, so an API error or a `Ctrl+C` leaves the conversation unchanged.
@@ -68,7 +68,36 @@ uv run main.py
 
 ## Adding a tool
 
-Subclass `Tool`, define its three class attributes and implement `run`:
+### With the `@tool` decorator
+
+For a simple tool, write a function with type annotations and a Google-style docstring:
+
+```python
+@tool
+def get_current_time(timezone: str) -> str:
+    """Get the current date and time in a given timezone.
+
+    Use it whenever the user asks for the time or date somewhere.
+
+    Args:
+        timezone: IANA timezone name, e.g. "Europe/Paris".
+    """
+    return datetime.now(ZoneInfo(timezone)).isoformat()
+```
+
+The decorator builds the tool from the function itself:
+
+| Tool field | Comes from |
+|---|---|
+| `name` | the function's name |
+| `description` | the docstring, before the first section |
+| `parameters` | the type annotations, the defaults (a parameter without a default is required) and the `Args:` section |
+
+Supported parameter types are `str`, `int`, `float` and `bool`. The tool is refused when it starts if a parameter has no annotation or no description, or if the docstring documents a parameter the function does not have, so the description sent to the model always matches the code.
+
+### With a `Tool` subclass
+
+For a tool that needs state or helper methods, like `calculate`, subclass `Tool`, define its three class attributes and implement `run`:
 
 ```python
 class MyTool(Tool):
@@ -87,7 +116,15 @@ class MyTool(Tool):
         return kwargs["arg"]
 ```
 
-Then register it in `main.py`: `Agent(..., tools=[CalculateTool(), GetCurrentTimeTool(), MyTool()])`.
+### Registering it
+
+Add it to the agent in `main.py`. A decorated function is already a tool instance, so it takes no parentheses:
+
+```python
+Agent(..., tools=[CalculateTool(), get_current_time, MyTool()])
+```
+
+Tool names must be unique: the agent refuses two tools with the same name.
 
 The `description` is a prompt: it is the only thing the model reads to decide when to use the tool. Say what the tool accepts and what it does not, so the model does not waste iterations on rejected calls.
 
@@ -109,7 +146,7 @@ The checks are `ruff format`, `ruff check` and `mypy` in strict mode. GitHub Act
 - [x] Conversation memory and terminal chat
 - [x] Tools with manual function calling
 - [x] Agent loop: chain several tool calls, with a maximum number of iterations
-- [ ] Tool registry
+- [x] Tool registry and `@tool` decorator
 - [ ] Tracing and human confirmation for sensitive tools
 - [ ] Going further: history summarization, planning, structured output, streaming
 
