@@ -1,8 +1,10 @@
 """Tools the agent can ask the model to call."""
 
 import ast
+import inspect
 import math
 import operator
+import typing
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from datetime import datetime
@@ -10,6 +12,64 @@ from typing import Any, ClassVar
 from zoneinfo import ZoneInfo
 
 from google.genai import types
+
+# Python types allowed for tool parameters, mapped to their JSON Schema type.
+_JSON_TYPES: dict[type, str] = {
+    str: "string",
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+}
+
+
+def build_parameters_schema(func: Callable[..., Any]) -> dict[str, Any]:
+    """Build the JSON Schema of a function's parameters from its signature.
+
+    Each parameter becomes a property whose JSON type is derived from its type
+    annotation. Parameters without a default value are listed as required.
+
+    Args:
+        func: The function to describe. Every parameter must be annotated with
+            one of the types in ``_JSON_TYPES``.
+
+    Returns:
+        A JSON Schema object describing the function's parameters.
+
+    Raises:
+        TypeError: If the function uses ``*args`` or ``**kwargs``, or if a
+            parameter has no type annotation or an unsupported type.
+    """
+    signature = inspect.signature(func)
+    hints = typing.get_type_hints(func)
+
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+
+    for name, param in signature.parameters.items():
+        hint = hints.get(name)
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            raise TypeError(f"{func.__name__} cannot use *args or **kwargs as a tool")
+
+        if hint is None:
+            raise TypeError(
+                f"Parameter {name!r} of {func.__name__} has no type annotation"
+            )
+
+        if hint not in _JSON_TYPES:
+            raise TypeError(
+                f"Parameter '{name}' of {func.__name__} has "
+                f"unsupported type {getattr(hint, '__name__', hint)}"
+            )
+
+        properties[name] = {"type": _JSON_TYPES[hint]}
+
+        if param.default is inspect.Parameter.empty:
+            required.append(name)
+
+    return {"type": "object", "properties": properties, "required": required}
 
 
 class Tool(ABC):
