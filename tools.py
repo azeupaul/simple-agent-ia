@@ -21,24 +21,79 @@ _JSON_TYPES: dict[type, str] = {
     bool: "boolean",
 }
 
+_SECTION_HEADERS = {"Args:", "Returns:", "Raises:", "Yields:", "Examples:", "Note:"}
+
+
+def _is_header(line: str) -> bool:
+    """Return True if the line starts a docstring section, such as "Args:"."""
+    return line.strip() in _SECTION_HEADERS
+
+
+def _description(lines: list[str]) -> str:
+    """Return the text before the first section header."""
+    description = []
+    for line in lines:
+        if _is_header(line):
+            break
+        description.append(line)
+    return "\n".join(description).strip()
+
+
+def _section(lines: list[str], header: str) -> list[str]:
+    """Return the lines of a section, without its header."""
+    section: list[str] = []
+    inside = False
+    for line in lines:
+        if _is_header(line):
+            inside = line.strip() == header
+            continue
+        if inside:
+            section.append(line)
+    return section
+
+
+def _parse_args(lines: list[str]) -> dict[str, str]:
+    """Map each parameter name to its description in an Args section."""
+    args: dict[str, str] = {}
+    current = None
+    for line in lines:
+        if line.startswith("        "):  # 8 spaces: continuation line
+            if current is not None:
+                args[current] += " " + line.strip()
+        elif line.startswith("    "):  # 4 spaces: new parameter
+            name, _, text = line.strip().partition(":")
+            current = name
+            args[name] = text.strip()
+    return args
+
+
+def parse_docstring(doc: str) -> tuple[str, dict[str, str]]:
+    """Split a Google-style docstring into a description and parameter docs."""
+    lines = doc.splitlines()
+    return _description(lines), _parse_args(_section(lines, "Args:"))
+
 
 def build_parameters_schema(func: Callable[..., Any]) -> dict[str, Any]:
-    """Build the JSON Schema of a function's parameters from its signature.
+    """Build the JSON Schema of a function's parameters.
 
-    Each parameter becomes a property whose JSON type is derived from its type
-    annotation. Parameters without a default value are listed as required.
+    Each parameter becomes a property: its JSON type comes from its type
+    annotation, and its description from the Args section of the function's
+    Google-style docstring. Parameters without a default value are required.
 
     Args:
         func: The function to describe. Every parameter must be annotated with
-            one of the types in ``_JSON_TYPES``.
+            one of the types in ``_JSON_TYPES`` and documented in ``Args:``.
 
     Returns:
         A JSON Schema object describing the function's parameters.
 
     Raises:
-        TypeError: If the function uses ``*args`` or ``**kwargs``, or if a
-            parameter has no type annotation or an unsupported type.
+        TypeError: If the function uses ``*args`` or ``**kwargs``, if a
+            parameter has no type annotation, an unsupported type or no
+            description, or if the docstring documents a parameter that the
+            function does not have.
     """
+    _, param_docs = parse_docstring(inspect.getdoc(func) or "")
     signature = inspect.signature(func)
     hints = typing.get_type_hints(func)
 
@@ -64,10 +119,24 @@ def build_parameters_schema(func: Callable[..., Any]) -> dict[str, Any]:
                 f"unsupported type {getattr(hint, '__name__', hint)}"
             )
 
-        properties[name] = {"type": _JSON_TYPES[hint]}
+        description = param_docs.get(name, "")
+        if not description:
+            raise TypeError(
+                f"Parameter {name!r} of {func.__name__} has no description "
+                "in the Args section of its docstring"
+            )
+
+        properties[name] = {"type": _JSON_TYPES[hint], "description": description}
 
         if param.default is inspect.Parameter.empty:
             required.append(name)
+
+    unknown = set(param_docs) - signature.parameters.keys()
+    if unknown:
+        raise TypeError(
+            f"The docstring of {func.__name__} documents unknown parameters: "
+            f"{sorted(unknown)}"
+        )
 
     return {"type": "object", "properties": properties, "required": required}
 
