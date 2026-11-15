@@ -7,7 +7,7 @@ from google import genai
 from google.genai import types
 
 from agent import Agent
-from tools import CalculateTool, GetCurrentTimeTool
+from tools import CalculateTool, get_current_time
 
 EXIT_COMMANDS = {"/quit", "/exit"}
 RESET_COMMAND = "/reset"
@@ -38,7 +38,7 @@ def main() -> None:
     agent = Agent(
         client=genai.Client(),
         model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-        tools=[CalculateTool(), GetCurrentTimeTool()],
+        tools=[CalculateTool(), get_current_time],
     )
 
     print("Welcome to simple agent!")

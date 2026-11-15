@@ -190,39 +190,52 @@ class Tool(ABC):
         )
 
 
-class GetCurrentTimeTool(Tool):
-    """Tool that returns the current time in ISO 8601 format."""
+def tool(func: Callable[..., Any]) -> Tool:
+    """Turn a documented function into a tool the model can call.
 
-    name = "get_current_time"
-    description = (
-        "Get the current date and time in a given timezone. "
-        "Use it whenever the user asks for the time or date somewhere, "
-        "since you cannot know the current time otherwise."
-    )
-    parameters: ClassVar[dict[str, Any]] = {
-        "type": "object",
-        "properties": {
-            "timezone": {
-                "type": "string",
-                "description": "IANA timezone name, e.g. 'Europe/Paris'",
-            }
-        },
-        "required": ["timezone"],
-    }
+    The tool's name is the function's name, its description is the docstring's
+    description, and its parameters schema is built from the signature and
+    the ``Args:`` section of the docstring.
 
-    def run(self, **kwargs: Any) -> str:
-        """Return the current time in ISO 8601 format.
+    Args:
+        func: The function to wrap. It must have a Google-style docstring and
+            a type annotation on every parameter.
 
-        Args:
-            **kwargs: Must contain ``timezone``, an IANA timezone name
-            such as "Europe/Paris".
+    Returns:
+        A tool instance that calls ``func`` with the arguments sent by the model.
 
-        Returns:
-            The current date and time in ISO 8601 format, with the UTC offset.
-        """
-        timezone = kwargs["timezone"]
+    Raises:
+        TypeError: If the docstring has no description, or if the parameters
+            cannot be described (see ``build_parameters_schema``).
+    """
+    func_description, _ = parse_docstring(inspect.getdoc(func) or "")
 
-        return datetime.now(ZoneInfo(timezone)).isoformat()
+    class FunctionTool(Tool):
+        name = func.__name__
+        description = func_description
+        parameters: ClassVar[dict[str, Any]] = build_parameters_schema(func)
+
+        def run(self, **kwargs: Any) -> Any:
+            return func(**kwargs)
+
+    return FunctionTool()
+
+
+@tool
+def get_current_time(timezone: str) -> str:
+    """Get the current date and time in a given timezone.
+
+    Use it whenever the user asks for the time or date somewhere, since you
+    cannot know the current time otherwise.
+
+    Args:
+        timezone: IANA timezone name, e.g. "Europe/Paris". Use the timezone
+            of the main city if the user gives a country.
+
+    Returns:
+        The current date and time in ISO 8601 format, with the UTC offset.
+    """
+    return datetime.now(ZoneInfo(timezone)).isoformat()
 
 
 class CalculateTool(Tool):
