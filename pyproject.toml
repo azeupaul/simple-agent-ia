@@ -13,6 +13,7 @@ dependencies = [
 dev = [
     "mypy>=2.4.1",
     "pre-commit>=4.7.0",
+    "pytest>=9.2.0",
     "ruff>=0.17.4",
 ]
 
@@ -37,7 +38,15 @@ select = [
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true
 warn_unreachable = true
+
+
+[tool.pytest]
+testpaths = ["tests"]
+pythonpath = ["."]
