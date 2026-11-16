@@ -135,11 +135,14 @@ If `run` raises an exception, the agent catches it and sends the error message t
 ## Development
 
 ```bash
+uv run pytest                     # run the tests
 uv run pre-commit install         # once: run the checks before each commit
 uv run pre-commit run --all-files # run them manually
 ```
 
-The checks are `ruff format`, `ruff check` and `mypy` in strict mode. GitHub Actions runs the same hooks on every push and pull request.
+The checks are `ruff format`, `ruff check`, `mypy` in strict mode and `pytest`. GitHub Actions runs the same hooks on every push and pull request.
+
+The tests never call Gemini: `tests/test_agent.py` replaces the client with a fake one that replays scripted responses, so they are free, fast and deterministic.
 
 ## Roadmap
 
