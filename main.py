@@ -1,17 +1,19 @@
 """Command-line chat with the agent."""
 
 import os
+from typing import Any, override
 
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-from agent import Agent
+from agent import Agent, AgentObserver
 from tools import CalculateTool, get_current_time
 
 EXIT_COMMANDS = {"/quit", "/exit"}
 RESET_COMMAND = "/reset"
 HISTORY_COMMAND = "/history"
+TRACER_COMMAND = "/trace"
 MAX_DISPLAY_LENGTH = 80
 
 
@@ -31,14 +33,60 @@ def format_part(role: str | None, part: types.Part) -> str:
     return f"[{role} unknown part]"
 
 
+class ConsoleTracer(AgentObserver):
+    """Print the agent's events in the terminal while tracing is enabled."""
+
+    def __init__(self, *, enabled: bool = False) -> None:
+        """Initialize the tracer.
+
+        Args:
+            enabled: Whether to print events from the start.
+        """
+        self.enabled = enabled
+
+    @override
+    def on_model_request(self, iteration: int) -> None:
+        """Print the number of the model call."""
+        if self.enabled:
+            print(f"    --> model call #{iteration}")
+
+    @override
+    def on_tool_call(self, call: types.FunctionCall) -> None:
+        """Print the tool name and its arguments."""
+        if self.enabled:
+            args = ", ".join(
+                f"{key}={value!r}" for key, value in (call.args or {}).items()
+            )
+            print(f"    --> {call.name}({args})")
+
+    @override
+    def on_tool_result(
+        self, name: str, response: dict[str, Any], duration: float
+    ) -> None:
+        """Print the tool's result or error, and how long it took."""
+        if self.enabled:
+            result = str(response)
+            if len(result) > MAX_DISPLAY_LENGTH:
+                result = result[: MAX_DISPLAY_LENGTH - 1] + "…"
+            print(f"    <-- {result} ({duration * 1000:.1f} ms)")
+
+    @override
+    def on_final_answer(self, iterations: int) -> None:
+        """Print how many model calls the answer took."""
+        if self.enabled:
+            print(f"    Answered after {iterations} model call(s)")
+
+
 def main() -> None:
     """Run an interactive chat session with the agent in the terminal."""
     load_dotenv()
 
+    tracer = ConsoleTracer()
     agent = Agent(
         client=genai.Client(),
         model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
         tools=[CalculateTool(), get_current_time],
+        observer=tracer,
     )
 
     print("Welcome to simple agent!")
@@ -46,6 +94,7 @@ def main() -> None:
     print(" - /reset to start a new conversation")
     print(" - /quit or /exit to end the session")
     print(" - /history to view the conversation history")
+    print(" - /trace to enable or disable traces")
     print("Type your message and press Enter to send it.\n")
 
     while True:
@@ -75,6 +124,10 @@ def main() -> None:
                 for content in agent.history:
                     for part in content.parts or []:
                         print(format_part(content.role, part))
+            continue
+        if command == TRACER_COMMAND:
+            tracer.enabled = not tracer.enabled
+            print(f"Tracing {'enabled' if tracer.enabled else 'disabled'}.\n")
             continue
 
         try:

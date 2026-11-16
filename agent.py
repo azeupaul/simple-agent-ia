@@ -1,11 +1,31 @@
 """Conversational agent backed by a Gemini model."""
 
+import time
 from collections.abc import Sequence
+from typing import Any
 
 from google import genai
 from google.genai import types
 
 from tools import Tool, ToolRegistry
+
+
+class AgentObserver:
+    """Receives the agent's events. Every method does nothing by default."""
+
+    def on_model_request(self, iteration: int) -> None:
+        """Called before each call to the model (iteration starts at 1)."""
+
+    def on_tool_call(self, call: types.FunctionCall) -> None:
+        """Called before a tool runs."""
+
+    def on_tool_result(
+        self, name: str, response: dict[str, Any], duration: float
+    ) -> None:
+        """Called after a tool runs, with its result or error and its duration."""
+
+    def on_final_answer(self, iterations: int) -> None:
+        """Called when the model answers with text, after this many model calls."""
 
 
 class Agent:
@@ -34,6 +54,7 @@ class Agent:
         system_instruction: str = DEFAULT_SYSTEM_INSTRUCTION,
         tools: Sequence[Tool] = (),
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        observer: AgentObserver | None = None,
     ) -> None:
         """Initialize the agent with an empty conversation.
 
@@ -44,6 +65,8 @@ class Agent:
             tools: Optional sequence of tools that the agent can use to answer
                 questions.
             max_iterations: Maximum number of model calls in a single turn.
+            observer: Receives the agent's events, e.g. to trace them.
+                Defaults to an observer that does nothing.
 
         Raises:
             ValueError: If max_iterations is less than 1.
@@ -62,6 +85,7 @@ class Agent:
         )
         self._history: list[types.Content] = []
         self._max_iterations = max_iterations
+        self._observer = observer or AgentObserver()
 
     @property
     def history(self) -> tuple[types.Content, ...]:
@@ -94,13 +118,17 @@ class Agent:
 
         turn: list[types.Content] = [user_content]
 
-        for _ in range(self._max_iterations):
+        for iteration in range(1, self._max_iterations + 1):
+            self._observer.on_model_request(iteration)
+
             model_content = self._generate([*self._history, *turn])
             turn.append(model_content)
 
             function_calls = self._function_calls(model_content)
             if not function_calls:
                 self._history.extend(turn)
+
+                self._observer.on_final_answer(iteration)
                 return self._text(model_content)
 
             tools_responses = [self._run_tool(call) for call in function_calls]
@@ -156,6 +184,9 @@ class Agent:
         name = call.name or ""
         tool = self._tools.get(name)
 
+        self._observer.on_tool_call(call)
+        start = time.perf_counter()
+
         if tool is None:
             response = {
                 "error": f"Unknown tool '{name}'. Available tools: {self._tools.names}"
@@ -166,6 +197,8 @@ class Agent:
                 response = {"result": tool_response}
             except Exception as error:
                 response = {"error": f"Tool request failed: {error!r}"}
+
+        self._observer.on_tool_result(name, response, time.perf_counter() - start)
 
         return types.Part.from_function_response(name=name, response=response)
 
