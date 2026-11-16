@@ -8,7 +8,7 @@ import typing
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from datetime import datetime
-from typing import Any, ClassVar
+from typing import Any, ClassVar, overload
 from zoneinfo import ZoneInfo
 
 from google.genai import types
@@ -152,11 +152,15 @@ class Tool(ABC):
             to request the tool, so it should be clear and specific.
         parameters: JSON Schema of the arguments. The model reads it to
             decide which arguments to send.
+        requires_confirmation: Whether the user must approve each run of the
+            tool. False by default.
     """
 
     name: ClassVar[str]
     description: ClassVar[str]
     parameters: ClassVar[dict[str, Any]]
+
+    requires_confirmation: ClassVar[bool] = False
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Check that subclasses define the required class attributes."""
@@ -190,8 +194,23 @@ class Tool(ABC):
         )
 
 
-def tool(func: Callable[..., Any]) -> Tool:
+@overload
+def tool(func: Callable[..., Any], /) -> Tool: ...
+
+
+@overload
+def tool(
+    *, requires_confirmation: bool = False
+) -> Callable[[Callable[..., Any]], Tool]: ...
+
+
+def tool(
+    func: Callable[..., Any] | None = None, /, *, requires_confirmation: bool = False
+) -> Tool | Callable[[Callable[..., Any]], Tool]:
     """Turn a documented function into a tool the model can call.
+
+    Use it as ``@tool``, or as ``@tool(requires_confirmation=True)`` for a
+    tool that the user must approve before each run.
 
     The tool's name is the function's name, its description is the docstring's
     description, and its parameters schema is built from the signature and
@@ -199,26 +218,36 @@ def tool(func: Callable[..., Any]) -> Tool:
 
     Args:
         func: The function to wrap. It must have a Google-style docstring and
-            a type annotation on every parameter.
+            a type annotation on every parameter. Omitted when the decorator
+            is called with arguments.
+        requires_confirmation: Whether the user must approve each run.
 
     Returns:
-        A tool instance that calls ``func`` with the arguments sent by the model.
+        The tool, or, when ``func`` is omitted, a decorator that builds it.
 
     Raises:
         TypeError: If the docstring has no description, or if the parameters
             cannot be described (see ``build_parameters_schema``).
     """
-    func_description, _ = parse_docstring(inspect.getdoc(func) or "")
+    needs_confirmation = requires_confirmation
 
-    class FunctionTool(Tool):
-        name = func.__name__
-        description = func_description
-        parameters: ClassVar[dict[str, Any]] = build_parameters_schema(func)
+    def decorate(func: Callable[..., Any]) -> Tool:
+        func_description, _ = parse_docstring(inspect.getdoc(func) or "")
 
-        def run(self, **kwargs: Any) -> Any:
-            return func(**kwargs)
+        class FunctionTool(Tool):
+            name = func.__name__
+            description = func_description
+            parameters: ClassVar[dict[str, Any]] = build_parameters_schema(func)
+            requires_confirmation = needs_confirmation
 
-    return FunctionTool()
+            def run(self, **kwargs: Any) -> Any:
+                return func(**kwargs)
+
+        return FunctionTool()
+
+    if func is None:  # used as @tool(...): return the decorator
+        return decorate
+    return decorate(func)  # used as @tool: decorate right away
 
 
 @tool

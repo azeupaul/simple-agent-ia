@@ -1,13 +1,18 @@
 """Conversational agent backed by a Gemini model."""
 
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from google import genai
 from google.genai import types
 
 from tools import Tool, ToolRegistry
+
+
+def _deny(call: types.FunctionCall) -> bool:
+    """Refuse every sensitive tool: the default when no confirm is given."""
+    return False
 
 
 class AgentObserver:
@@ -55,6 +60,7 @@ class Agent:
         tools: Sequence[Tool] = (),
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         observer: AgentObserver | None = None,
+        confirm: Callable[[types.FunctionCall], bool] | None = None,
     ) -> None:
         """Initialize the agent with an empty conversation.
 
@@ -67,6 +73,8 @@ class Agent:
             max_iterations: Maximum number of model calls in a single turn.
             observer: Receives the agent's events, e.g. to trace them.
                 Defaults to an observer that does nothing.
+            confirm: Asks the user whether a sensitive tool may run, and returns True
+                to allow it. By default, every sensitive tool is refused.
 
         Raises:
             ValueError: If max_iterations is less than 1.
@@ -86,6 +94,7 @@ class Agent:
         self._history: list[types.Content] = []
         self._max_iterations = max_iterations
         self._observer = observer or AgentObserver()
+        self._confirm = confirm or _deny
 
     @property
     def history(self) -> tuple[types.Content, ...]:
@@ -190,6 +199,11 @@ class Agent:
         if tool is None:
             response = {
                 "error": f"Unknown tool '{name}'. Available tools: {self._tools.names}"
+            }
+        elif tool.requires_confirmation and not self._confirm(call):
+            response = {
+                "error": "The user declined to run this tool. "
+                "Do not retry it unless the user asks."
             }
         else:
             try:

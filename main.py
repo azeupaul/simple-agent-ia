@@ -33,6 +33,12 @@ def format_part(role: str | None, part: types.Part) -> str:
     return f"[{role} unknown part]"
 
 
+def format_call(call: types.FunctionCall) -> str:
+    """Return a one-line, human-readable call to a tool."""
+    args = ", ".join(f"{key}={value!r}" for key, value in (call.args or {}).items())
+    return f"{call.name}({args})"
+
+
 class ConsoleTracer(AgentObserver):
     """Print the agent's events in the terminal while tracing is enabled."""
 
@@ -54,10 +60,7 @@ class ConsoleTracer(AgentObserver):
     def on_tool_call(self, call: types.FunctionCall) -> None:
         """Print the tool name and its arguments."""
         if self.enabled:
-            args = ", ".join(
-                f"{key}={value!r}" for key, value in (call.args or {}).items()
-            )
-            print(f"    --> {call.name}({args})")
+            print(f"    --> {format_call(call)}")
 
     @override
     def on_tool_result(
@@ -77,6 +80,25 @@ class ConsoleTracer(AgentObserver):
             print(f"    Answered after {iterations} model call(s)")
 
 
+def ask_confirmation(call: types.FunctionCall) -> bool:
+    """Ask the user whether the model may run this tool call.
+
+    Ctrl+C is not caught here: it cancels the whole request in main().
+
+    Returns:
+        True only if the user answers "y" or "yes"; False otherwise, or on Ctrl+D.
+    """
+    print(f"The model wants to run {format_call(call)}")
+
+    try:
+        answer = input("Allow it? [y/N] ")
+    except EOFError:
+        print()
+        return False
+
+    return answer.strip().lower() in {"y", "yes"}
+
+
 def main() -> None:
     """Run an interactive chat session with the agent in the terminal."""
     load_dotenv()
@@ -87,6 +109,7 @@ def main() -> None:
         model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
         tools=[CalculateTool(), get_current_time],
         observer=tracer,
+        confirm=ask_confirmation,
     )
 
     print("Welcome to simple agent!")
