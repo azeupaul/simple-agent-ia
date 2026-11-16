@@ -1,10 +1,10 @@
-from typing import Any, cast
+from typing import Any, cast, override
 
 import pytest
 from google import genai
 from google.genai import errors, types
 
-from agent import Agent
+from agent import Agent, AgentObserver
 from tools import tool
 
 
@@ -72,14 +72,53 @@ def fail() -> str:
     raise ValueError("boom")
 
 
+class RecordingObserver(AgentObserver):
+    """Records the agent's events as short strings, so tests can compare them."""
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+        self.durations: list[float] = []
+
+    @override
+    def on_model_request(self, iteration: int) -> None:
+        self.events.append(f"model #{iteration}")
+
+    @override
+    def on_tool_call(self, call: types.FunctionCall) -> None:
+        self.events.append(f"call {call.name}")
+
+    @override
+    def on_tool_result(
+        self, name: str, response: dict[str, Any], duration: float
+    ) -> None:
+        # The response has a single key: "result" or "error".
+        [kind] = response
+        self.events.append(f"{kind} {name}")
+        self.durations.append(duration)
+
+    @override
+    def on_final_answer(self, iterations: int) -> None:
+        self.events.append(f"answer after {iterations}")
+
+
 @pytest.fixture
 def client() -> FakeClient:
     return FakeClient()
 
 
 @pytest.fixture
-def agent(client: FakeClient) -> Agent:
-    return Agent(cast(genai.Client, client), model="fake-model", tools=[add, fail])
+def observer() -> RecordingObserver:
+    return RecordingObserver()
+
+
+@pytest.fixture
+def agent(client: FakeClient, observer: RecordingObserver) -> Agent:
+    return Agent(
+        cast(genai.Client, client),
+        model="fake-model",
+        tools=[add, fail],
+        observer=observer,
+    )
 
 
 # Plain conversation
@@ -251,3 +290,79 @@ def test_keeps_the_history_unchanged_when_a_turn_fails(
         agent.chat("What is 1 + 1?")
 
     assert agent.history == history_before
+
+
+# Observer
+
+
+def test_notifies_every_step_of_a_turn_in_order(
+    client: FakeClient, agent: Agent, observer: RecordingObserver
+) -> None:
+    client.models.responses = [reply(call("add", a=2, b=3)), reply(text("It is 5."))]
+
+    agent.chat("What is 2 + 3?")
+
+    assert observer.events == [
+        "model #1",
+        "call add",
+        "result add",
+        "model #2",
+        "answer after 2",
+    ]
+
+
+def test_notifies_failed_and_unknown_tools(
+    client: FakeClient, agent: Agent, observer: RecordingObserver
+) -> None:
+    client.models.responses = [
+        reply(call("fail"), call("weather")),
+        reply(text("Nothing worked.")),
+    ]
+
+    agent.chat("Try them")
+
+    assert observer.events == [
+        "model #1",
+        "call fail",
+        "error fail",
+        "call weather",
+        "error weather",
+        "model #2",
+        "answer after 2",
+    ]
+
+
+def test_measures_a_positive_tool_duration(
+    client: FakeClient, agent: Agent, observer: RecordingObserver
+) -> None:
+    client.models.responses = [reply(call("add", a=2, b=3)), reply(text("It is 5."))]
+
+    agent.chat("What is 2 + 3?")
+
+    [duration] = observer.durations
+    assert duration >= 0
+
+
+def test_does_not_announce_an_answer_when_the_limit_is_reached(
+    client: FakeClient, observer: RecordingObserver
+) -> None:
+    agent = Agent(
+        cast(genai.Client, client),
+        model="fake-model",
+        tools=[add],
+        max_iterations=1,
+        observer=observer,
+    )
+    client.models.responses = [reply(call("add", a=1, b=1))]
+
+    with pytest.raises(RuntimeError):
+        agent.chat("Loop forever")
+
+    assert observer.events == ["model #1", "call add", "result add"]
+
+
+def test_works_without_an_observer(client: FakeClient) -> None:
+    agent = Agent(cast(genai.Client, client), model="fake-model", tools=[add])
+    client.models.responses = [reply(call("add", a=2, b=3)), reply(text("It is 5."))]
+
+    assert agent.chat("What is 2 + 3?") == "It is 5."
