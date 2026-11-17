@@ -194,7 +194,7 @@ class Agent:
         tool = self._tools.get(name)
 
         self._observer.on_tool_call(call)
-        start = time.perf_counter()
+        duration = 0.0
 
         if tool is None:
             response = {
@@ -206,13 +206,15 @@ class Agent:
                 "Do not retry it unless the user asks."
             }
         else:
+            start = time.perf_counter()
             try:
                 tool_response = tool.run(**(call.args or {}))
                 response = {"result": tool_response}
             except Exception as error:
                 response = {"error": f"Tool request failed: {error!r}"}
+            duration = time.perf_counter() - start
 
-        self._observer.on_tool_result(name, response, time.perf_counter() - start)
+        self._observer.on_tool_result(name, response, duration)
 
         return types.Part.from_function_response(name=name, response=response)
 

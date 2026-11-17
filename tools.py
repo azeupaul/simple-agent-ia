@@ -4,14 +4,20 @@ import ast
 import inspect
 import math
 import operator
+import re
 import typing
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from datetime import datetime
+from pathlib import Path
 from typing import Any, ClassVar, overload
 from zoneinfo import ZoneInfo
 
 from google.genai import types
+
+NOTES_DIR = Path("notes")
+MAX_NOTE_LENGTH = 10_000
+_TITLE_PATTERN = re.compile(r"[\w -]{1,50}")
 
 # Python types allowed for tool parameters, mapped to their JSON Schema type.
 _JSON_TYPES: dict[type, str] = {
@@ -265,6 +271,58 @@ def get_current_time(timezone: str) -> str:
         The current date and time in ISO 8601 format, with the UTC offset.
     """
     return datetime.now(ZoneInfo(timezone)).isoformat()
+
+
+@tool(requires_confirmation=True)
+def write_note(title: str, content: str) -> str:
+    """Save a note as a Markdown file in the notes folder.
+
+    Use it when the user asks to save, write down or remember something in
+    a note. The user is asked to approve each note before it is written.
+    An existing note is never overwritten: choose another title if needed.
+
+    Args:
+        title: Short title of the note, also used as its file name: 1 to 50
+            letters, digits, spaces, "_" or "-", without dots or slashes.
+            E.g. "Meeting Thursday".
+        content: Text of the note, in Markdown, at most 10000 characters.
+
+    Returns:
+        The path of the saved note.
+
+    Raises:
+        ValueError: If the title is invalid, the note already exists, or the
+            content is too long.
+    """
+    length = len(content)
+    if length > MAX_NOTE_LENGTH:
+        raise ValueError(
+            f"The content is too long ({length}). The max allowed is {MAX_NOTE_LENGTH}"
+        )
+
+    if not _TITLE_PATTERN.fullmatch(title):
+        raise ValueError(
+            f"Invalid title {title!r}: use 1 to 50 letters, digits, spaces, "
+            "'_' or '-', without dots or slashes"
+        )
+
+    file_path = NOTES_DIR.joinpath(f"{title}.md")
+
+    if not file_path.resolve().is_relative_to(NOTES_DIR.resolve()):
+        raise ValueError(
+            f"Invalid title {title!r}: the note must stay in the notes folder"
+        )
+
+    NOTES_DIR.mkdir(exist_ok=True)
+    try:
+        with file_path.open("x", encoding="utf-8") as file:
+            file.write(content)
+    except FileExistsError:
+        raise ValueError(
+            f"A note titled {title!r} already exists: choose another title"
+        ) from None
+
+    return str(file_path)
 
 
 class CalculateTool(Tool):
