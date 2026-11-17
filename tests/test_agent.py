@@ -366,3 +366,124 @@ def test_works_without_an_observer(client: FakeClient) -> None:
     client.models.responses = [reply(call("add", a=2, b=3)), reply(text("It is 5."))]
 
     assert agent.chat("What is 2 + 3?") == "It is 5."
+
+
+# Confirmation of sensitive tools
+
+
+@tool(requires_confirmation=True)
+def erase(target: str) -> str:
+    """Erase something.
+
+    Args:
+        target: What to erase.
+    """
+    return f"erased {target}"
+
+
+class RecordingConfirm:
+    """A confirm function that gives a fixed answer and records what it was asked."""
+
+    def __init__(self, *, answer: bool) -> None:
+        self.answer = answer
+        self.asked: list[tuple[str | None, dict[str, Any] | None]] = []
+
+    def __call__(self, call: types.FunctionCall) -> bool:
+        self.asked.append((call.name, call.args))
+        return self.answer
+
+
+def make_agent(
+    client: FakeClient,
+    *,
+    confirm: RecordingConfirm | None = None,
+    observer: AgentObserver | None = None,
+) -> Agent:
+    return Agent(
+        cast(genai.Client, client),
+        model="fake-model",
+        tools=[add, erase],
+        confirm=confirm,
+        observer=observer,
+    )
+
+
+DECLINED = {
+    "error": "The user declined to run this tool. Do not retry it unless the user asks."
+}
+
+
+def test_runs_a_sensitive_tool_when_the_user_accepts(client: FakeClient) -> None:
+    agent = make_agent(client, confirm=RecordingConfirm(answer=True))
+    client.models.responses = [
+        reply(call("erase", target="logs")),
+        reply(text("Done.")),
+    ]
+
+    agent.chat("Erase the logs")
+
+    assert function_responses(client.models.calls[1][-1]) == [{"result": "erased logs"}]
+
+
+def test_reports_a_declined_tool_to_the_model(client: FakeClient) -> None:
+    agent = make_agent(client, confirm=RecordingConfirm(answer=False))
+    client.models.responses = [
+        reply(call("erase", target="logs")),
+        reply(text("I did not erase them.")),
+    ]
+
+    assert agent.chat("Erase the logs") == "I did not erase them."
+    assert function_responses(client.models.calls[1][-1]) == [DECLINED]
+
+
+def test_declines_sensitive_tools_by_default(client: FakeClient) -> None:
+    agent = make_agent(client)  # no confirm function
+    client.models.responses = [reply(call("erase", target="logs")), reply(text("No."))]
+
+    agent.chat("Erase the logs")
+
+    assert function_responses(client.models.calls[1][-1]) == [DECLINED]
+
+
+def test_asks_with_the_exact_call_of_the_model(client: FakeClient) -> None:
+    confirm = RecordingConfirm(answer=True)
+    agent = make_agent(client, confirm=confirm)
+    client.models.responses = [
+        reply(call("erase", target="logs")),
+        reply(text("Done.")),
+    ]
+
+    agent.chat("Erase the logs")
+
+    assert confirm.asked == [("erase", {"target": "logs"})]
+
+
+def test_never_asks_for_a_tool_that_does_not_require_it(client: FakeClient) -> None:
+    confirm = RecordingConfirm(answer=False)
+    agent = make_agent(client, confirm=confirm)
+    client.models.responses = [reply(call("add", a=2, b=3)), reply(text("It is 5."))]
+
+    agent.chat("What is 2 + 3?")
+
+    assert confirm.asked == []
+    assert function_responses(client.models.calls[1][-1]) == [{"result": 5}]
+
+
+def test_notifies_a_declined_tool_without_duration(
+    client: FakeClient, observer: RecordingObserver
+) -> None:
+    agent = make_agent(
+        client, confirm=RecordingConfirm(answer=False), observer=observer
+    )
+    client.models.responses = [reply(call("erase", target="logs")), reply(text("No."))]
+
+    agent.chat("Erase the logs")
+
+    assert observer.events == [
+        "model #1",
+        "call erase",
+        "error erase",
+        "model #2",
+        "answer after 2",
+    ]
+    assert observer.durations == [0.0]
