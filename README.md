@@ -11,12 +11,15 @@ A learning project to understand how an AI agent works by building one **without
 - Parallel tool calls in a single response
 - Tool errors are reported to the model, which can correct itself and retry
 - Conversation inspection with `/history`
+- Live tracing of the agent loop with `/trace`: model calls, tool calls, results and durations
+- Human confirmation: sensitive tools run only after the user approves the exact call
 
 ### Available tools
 
 | Tool | Description |
 |---|---|
 | `get_current_time` | Current date and time in a given IANA timezone |
+| `write_note` | Saves a note as a Markdown file in `notes/`. **Requires confirmation.** |
 | `calculate` | Arithmetic evaluator (`+ - * / // % **`, parentheses). It parses the expression with `ast` and never calls `eval`, and it rejects results that would be too large to compute or send back. |
 
 ## How it works
@@ -40,6 +43,36 @@ The model never runs anything itself: it only **requests** a tool, based on the 
 
 A turn is committed to the history only once it completes, so an API error or a `Ctrl+C` leaves the conversation unchanged.
 
+### Tracing
+
+The agent announces each step of its loop to an **observer** (`AgentObserver`), without knowing who listens. In the terminal, `/trace` turns on a `ConsoleTracer`:
+
+```
+    --> model call #1
+    --> get_current_time(timezone='Asia/Tokyo')
+    <-- {'result': '2026-11-17T01:35:06+09:00'} (7.0 ms)
+    --> model call #2
+    --> calculate(expression='24 * 60 - (1 * 60 + 35)')
+    <-- {'result': 1345} (0.2 ms)
+    --> model call #3
+    Answered after 3 model call(s)
+```
+
+Tracing shows the cost and the path of an answer, not only the answer: how many model calls it took, and which tools were called with which arguments.
+
+### Confirmation of sensitive tools
+
+A tool marked `requires_confirmation` runs only if the user approves the exact call, arguments included:
+
+```
+The model wants to run write_note(title='Meeting Thursday', content='Meeting on Thursday at 10.')
+Allow it? [y/N]
+```
+
+Anything other than `y` or `yes` refuses, and the model is told that the user declined. An agent created without a `confirm` function refuses every sensitive tool: forgetting the configuration closes access instead of opening it.
+
+`write_note` also protects itself, since the model chooses the file name: titles are limited to letters, digits, spaces, `_` and `-`, the final path must stay in `notes/`, an existing note is never overwritten, and the content is limited to 10,000 characters.
+
 ## Getting started
 
 Requirements: Python 3.12+, [uv](https://docs.astral.sh/uv/) and a [Gemini API key](https://aistudio.google.com/apikey).
@@ -62,6 +95,7 @@ uv run main.py
 | Command | Action |
 |---|---|
 | `/history` | Show the conversation, including tool calls and results |
+| `/trace` | Turn tracing of the agent loop on or off |
 | `/reset` | Start a new conversation |
 | `/quit`, `/exit`, `Ctrl+D` | Leave |
 | `Ctrl+C` | Cancel the current request, or leave at the prompt |
@@ -84,6 +118,8 @@ def get_current_time(timezone: str) -> str:
     """
     return datetime.now(ZoneInfo(timezone)).isoformat()
 ```
+
+For a tool with side effects, use `@tool(requires_confirmation=True)`: the user will be asked to approve each call.
 
 The decorator builds the tool from the function itself:
 
@@ -150,8 +186,13 @@ The tests never call Gemini: `tests/test_agent.py` replaces the client with a fa
 - [x] Tools with manual function calling
 - [x] Agent loop: chain several tool calls, with a maximum number of iterations
 - [x] Tool registry and `@tool` decorator
-- [ ] Tracing and human confirmation for sensitive tools
+- [x] Tracing and human confirmation for sensitive tools
 - [ ] Going further: history summarization, planning, structured output, streaming
+
+## Known limitations
+
+- The model may request a call again after the user declined it in the same turn. Each run still needs a new approval, so nothing runs without consent, but the user may have to say no twice.
+- Note titles are case-sensitive on Linux: `Meeting` and `meeting` create two notes, while macOS and Windows treat them as the same file and refuse the second one.
 
 ## License
 
