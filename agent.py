@@ -32,6 +32,9 @@ class AgentObserver:
     def on_final_answer(self, iterations: int) -> None:
         """Called when the model answers with text, after this many model calls."""
 
+    def on_usage(self, prompt_tokens: int, output_tokens: int) -> None:
+        """Called after each model call, with the tokens it consumed."""
+
 
 class Agent:
     """A conversational agent that keeps the history of its exchanges with Gemini.
@@ -95,11 +98,21 @@ class Agent:
         self._max_iterations = max_iterations
         self._observer = observer or AgentObserver()
         self._confirm = confirm or _deny
+        self._context_tokens: int = 0
 
     @property
     def history(self) -> tuple[types.Content, ...]:
         """Read-only snapshot of the conversation, oldest message first."""
         return tuple(self._history)
+
+    @property
+    def context_tokens(self) -> int:
+        """Approximate size of the conversation, in tokens, after the last model call.
+
+        It is the prompt sent on the last call (history, instructions and tool
+        declarations) plus the reply. 0 before the first call.
+        """
+        return self._context_tokens
 
     def chat_stream(self, user_prompt: str) -> Generator[str, None, None]:
         """Send a message to the model and stream its reply as it is written.
@@ -178,6 +191,7 @@ class Agent:
     def reset(self) -> None:
         """Start a new conversation by clearing the history."""
         self._history.clear()
+        self._context_tokens = 0
 
     def _stream(
         self, contents: list[types.Content]
@@ -196,12 +210,16 @@ class Agent:
                 (the response may have been blocked).
         """
         parts: list[types.Part] = []
+        usage = None
         try:
             for chunk in self._client.models.generate_content_stream(
                 model=self._model,
                 contents=contents,
                 config=self._config,
             ):
+                if chunk.usage_metadata:
+                    usage = chunk.usage_metadata
+
                 if (
                     not chunk.candidates
                     or chunk.candidates[0].content is None
@@ -217,6 +235,17 @@ class Agent:
             raise RuntimeError(f"Gemini request failed: {error}") from error
         except Exception as error:  # network, timeout... the SDK does not wrap them all
             raise RuntimeError(f"Gemini request failed: {error!r}") from error
+
+        if usage:
+            prompt_tokens = usage.prompt_token_count or 0
+            output_tokens = usage.candidates_token_count or 0
+            self._observer.on_usage(
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+            )
+            # Not total_token_count: it also counts thinking tokens, which are
+            # billed but not kept in the history.
+            self._context_tokens = prompt_tokens + output_tokens
 
         if not parts:
             raise RuntimeError(

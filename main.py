@@ -14,6 +14,7 @@ EXIT_COMMANDS = {"/quit", "/exit"}
 RESET_COMMAND = "/reset"
 HISTORY_COMMAND = "/history"
 TRACER_COMMAND = "/trace"
+TOKEN_COMMAND = "/tokens"
 MAX_DISPLAY_LENGTH = 80
 
 
@@ -151,6 +152,14 @@ class ConsoleTracer(AgentObserver):
         if self.enabled:
             self._console.line(f"    Answered after {iterations} model call(s)")
 
+    @override
+    def on_usage(self, prompt_tokens: int, output_tokens: int) -> None:
+        """Print the tokens sent and received by the model call."""
+        if self.enabled:
+            self._console.line(
+                f"    <-- {prompt_tokens} tokens in, {output_tokens} out"
+            )
+
 
 def main() -> None:
     """Run an interactive chat session with the agent in the terminal."""
@@ -168,10 +177,11 @@ def main() -> None:
 
     console.line("Welcome to simple agent!")
     console.line("Available Commands:")
-    console.line(" - /reset to start a new conversation")
-    console.line(" - /quit or /exit to end the session")
     console.line(" - /history to view the conversation history")
     console.line(" - /trace to enable or disable traces")
+    console.line(" - /tokens to show the size of the conversation in tokens")
+    console.line(" - /reset to start a new conversation")
+    console.line(" - /quit or /exit to end the session")
     console.line("Type your message and press Enter to send it.\n")
 
     while True:
@@ -202,9 +212,14 @@ def main() -> None:
                     for line in format_content(content):
                         console.line(line)
             continue
+
         if command == TRACER_COMMAND:
             tracer.enabled = not tracer.enabled
             console.line(f"Tracing {'enabled' if tracer.enabled else 'disabled'}.")
+            continue
+
+        if command == TOKEN_COMMAND:
+            console.line(f"Conversation size: {agent.context_tokens} tokens.")
             continue
 
         try:

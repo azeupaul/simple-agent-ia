@@ -118,6 +118,10 @@ class RecordingObserver(AgentObserver):
     def on_final_answer(self, iterations: int) -> None:
         self.events.append(f"answer after {iterations}")
 
+    @override
+    def on_usage(self, prompt_tokens: int, output_tokens: int) -> None:
+        self.events.append(f"usage {prompt_tokens}+{output_tokens}")
+
 
 @pytest.fixture
 def client() -> FakeClient:
@@ -594,3 +598,81 @@ def test_keeps_the_history_unchanged_when_the_caller_stops_early(
     stream.close()  # what happens when the user presses Ctrl+C while reading
 
     assert agent.history == ()
+
+
+# Token usage
+
+
+def with_usage(
+    response: types.GenerateContentResponse, *, prompt: int, output: int, thoughts: int
+) -> types.GenerateContentResponse:
+    """Attach token counts to a response, as Gemini does on the last chunk."""
+    response.usage_metadata = types.GenerateContentResponseUsageMetadata(
+        prompt_token_count=prompt,
+        candidates_token_count=output,
+        thoughts_token_count=thoughts,
+        total_token_count=prompt + output + thoughts,
+    )
+    return response
+
+
+def test_reports_the_tokens_of_each_model_call(
+    client: FakeClient, agent: Agent, observer: RecordingObserver
+) -> None:
+    client.models.responses = [
+        [
+            reply(text("Hel")),
+            with_usage(reply(text("lo")), prompt=120, output=30, thoughts=0),
+        ]
+    ]
+
+    agent.chat("Hi")
+
+    assert "usage 120+30" in observer.events
+
+
+def test_context_tokens_ignore_thinking_tokens(
+    client: FakeClient, agent: Agent
+) -> None:
+    # Thinking tokens are billed but not kept in the history.
+    client.models.responses = [
+        with_usage(reply(text("Hello")), prompt=120, output=30, thoughts=50)
+    ]
+
+    agent.chat("Hi")
+
+    assert agent.context_tokens == 150
+
+
+def test_context_tokens_follow_the_last_model_call(
+    client: FakeClient, agent: Agent
+) -> None:
+    client.models.responses = [
+        with_usage(reply(call("add", a=2, b=3)), prompt=100, output=10, thoughts=0),
+        with_usage(reply(text("It is 5.")), prompt=130, output=5, thoughts=0),
+    ]
+
+    agent.chat("What is 2 + 3?")
+
+    assert agent.context_tokens == 135
+
+
+def test_context_tokens_start_at_zero_and_reset(
+    client: FakeClient, agent: Agent
+) -> None:
+    assert agent.context_tokens == 0
+    client.models.responses = [
+        with_usage(reply(text("Hello")), prompt=120, output=30, thoughts=0)
+    ]
+    agent.chat("Hi")
+
+    agent.reset()
+
+    assert agent.context_tokens == 0
+
+
+def test_works_without_token_counts(client: FakeClient, agent: Agent) -> None:
+    client.models.responses = [reply(text("Hello"))]
+
+    assert agent.chat("Hi") == "Hello"
+    assert agent.context_tokens == 0
