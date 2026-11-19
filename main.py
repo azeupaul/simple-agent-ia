@@ -17,13 +17,24 @@ TRACER_COMMAND = "/trace"
 MAX_DISPLAY_LENGTH = 80
 
 
+def shorten(text: str, max_length: int = MAX_DISPLAY_LENGTH) -> str:
+    """Return the text, cut with "…" if it is longer than max_length."""
+    if len(text) > max_length:
+        text = text[: max_length - 1] + "…"
+
+    return text.replace("\n", " ")
+
+
+def format_call(call: types.FunctionCall) -> str:
+    """Return a one-line, human-readable call to a tool."""
+    args = ", ".join(f"{key}={value!r}" for key, value in (call.args or {}).items())
+    return f"{call.name}({args})"
+
+
 def format_part(role: str | None, part: types.Part) -> str:
     """Return a one-line, human-readable summary of a message part."""
     if part.text:
-        text = part.text.replace("\n", " ")
-        if len(text) > MAX_DISPLAY_LENGTH:
-            text = text[: MAX_DISPLAY_LENGTH - 1] + "…"
-        return f"[{role} text]: {text}"
+        return f"[{role} text]: {shorten(part.text)}"
     if part.function_call:
         call = part.function_call
         return f"[{role} call]: {call.name}({call.args})"
@@ -33,34 +44,97 @@ def format_part(role: str | None, part: types.Part) -> str:
     return f"[{role} unknown part]"
 
 
-def format_call(call: types.FunctionCall) -> str:
-    """Return a one-line, human-readable call to a tool."""
-    args = ", ".join(f"{key}={value!r}" for key, value in (call.args or {}).items())
-    return f"{call.name}({args})"
+def format_content(content: types.Content) -> list[str]:
+    """Return one line per part of a message, with consecutive texts joined.
+
+    Streaming splits the model's text into many parts; they are joined here
+    for display only. The history itself keeps the parts as received.
+    """
+    lines: list[str] = []
+    texts: list[str] = []  # the "basket": pieces of text waiting to be joined
+
+    def flush_texts() -> None:
+        """Empty the basket into a single text line."""
+        if texts:
+            joined = types.Part.from_text(text="".join(texts))
+            lines.append(format_part(content.role, joined))
+            texts.clear()
+
+    for part in content.parts or []:
+        if part.text:
+            texts.append(part.text)
+        elif part.function_call or part.function_response:
+            flush_texts()
+            lines.append(format_part(content.role, part))
+        # Any other part (e.g. empty text carrying a thought signature) is skipped.
+
+    flush_texts()
+
+    return lines
+
+
+class Console:
+    """Terminal output that keeps the streamed reply apart from other lines."""
+
+    def __init__(self) -> None:
+        """Start with no reply line open."""
+        self._replying = False  # True while a reply line is open
+
+    def reply(self, piece: str) -> None:
+        """Print a piece of the agent's reply, starting the line if needed."""
+        if not self._replying:
+            print("Agent: ", end="")
+            self._replying = True
+        print(piece, end="", flush=True)
+
+    def end_reply(self) -> None:
+        """Close the reply line, if one is open."""
+        if self._replying:
+            print()
+            self._replying = False
+
+    def line(self, text: str) -> None:
+        """Print a full line, on its own, below any open reply."""
+        self.end_reply()
+        print(text)
+
+    def confirm(self, call: types.FunctionCall) -> bool:
+        """Ask the user whether the model may run this tool call."""
+        self.line(f"The model wants to run {format_call(call)}")
+
+        try:
+            answer = input("Allow it? [y/N] ")
+        except EOFError:
+            self.line("")
+            return False
+
+        return answer.strip().lower() in {"y", "yes"}
 
 
 class ConsoleTracer(AgentObserver):
     """Print the agent's events in the terminal while tracing is enabled."""
 
-    def __init__(self, *, enabled: bool = False) -> None:
+    def __init__(self, console: Console, *, enabled: bool = False) -> None:
         """Initialize the tracer.
 
         Args:
             enabled: Whether to print events from the start.
+            console: Where to print the events.
         """
         self.enabled = enabled
+        self._console = console
 
     @override
     def on_model_request(self, iteration: int) -> None:
         """Print the number of the model call."""
         if self.enabled:
-            print(f"    --> model call #{iteration}")
+            self._console.line(f"    --> model call #{iteration}")
 
     @override
     def on_tool_call(self, call: types.FunctionCall) -> None:
         """Print the tool name and its arguments."""
         if self.enabled:
-            print(f"    --> {format_call(call)}")
+            self._console.line(f"    --> {shorten(format_call(call))}")
 
     @override
     def on_tool_result(
@@ -69,62 +143,42 @@ class ConsoleTracer(AgentObserver):
         """Print the tool's result or error, and how long it took."""
         if self.enabled:
             result = str(response)
-            if len(result) > MAX_DISPLAY_LENGTH:
-                result = result[: MAX_DISPLAY_LENGTH - 1] + "…"
-            print(f"    <-- {result} ({duration * 1000:.1f} ms)")
+            self._console.line(f"    <-- {shorten(result)} ({duration * 1000:.1f} ms)")
 
     @override
     def on_final_answer(self, iterations: int) -> None:
         """Print how many model calls the answer took."""
         if self.enabled:
-            print(f"    Answered after {iterations} model call(s)")
-
-
-def ask_confirmation(call: types.FunctionCall) -> bool:
-    """Ask the user whether the model may run this tool call.
-
-    Ctrl+C is not caught here: it cancels the whole request in main().
-
-    Returns:
-        True only if the user answers "y" or "yes"; False otherwise, or on Ctrl+D.
-    """
-    print(f"The model wants to run {format_call(call)}")
-
-    try:
-        answer = input("Allow it? [y/N] ")
-    except EOFError:
-        print()
-        return False
-
-    return answer.strip().lower() in {"y", "yes"}
+            self._console.line(f"    Answered after {iterations} model call(s)")
 
 
 def main() -> None:
     """Run an interactive chat session with the agent in the terminal."""
     load_dotenv()
 
-    tracer = ConsoleTracer()
+    console = Console()
+    tracer = ConsoleTracer(console=console)
     agent = Agent(
         client=genai.Client(),
         model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
         tools=[CalculateTool(), get_current_time, write_note],
         observer=tracer,
-        confirm=ask_confirmation,
+        confirm=console.confirm,
     )
 
-    print("Welcome to simple agent!")
-    print("Available Commands:")
-    print(" - /reset to start a new conversation")
-    print(" - /quit or /exit to end the session")
-    print(" - /history to view the conversation history")
-    print(" - /trace to enable or disable traces")
-    print("Type your message and press Enter to send it.\n")
+    console.line("Welcome to simple agent!")
+    console.line("Available Commands:")
+    console.line(" - /reset to start a new conversation")
+    console.line(" - /quit or /exit to end the session")
+    console.line(" - /history to view the conversation history")
+    console.line(" - /trace to enable or disable traces")
+    console.line("Type your message and press Enter to send it.\n")
 
     while True:
         try:
             user_input = input("You: ").strip()
         except (KeyboardInterrupt, EOFError):
-            print()  # newline so the goodbye isn't glued to the prompt
+            console.line("")
             break
 
         if not user_input:
@@ -137,34 +191,34 @@ def main() -> None:
 
         if command == RESET_COMMAND:
             agent.reset()
-            print("[conversation reset]")
+            console.line("[conversation reset]")
             continue
 
         if command == HISTORY_COMMAND:
             if not agent.history:
-                print("[no conversation history]")
+                console.line("[no conversation history]")
             else:
                 for content in agent.history:
-                    for part in content.parts or []:
-                        print(format_part(content.role, part))
+                    for line in format_content(content):
+                        console.line(line)
             continue
         if command == TRACER_COMMAND:
             tracer.enabled = not tracer.enabled
-            print(f"Tracing {'enabled' if tracer.enabled else 'disabled'}.\n")
+            console.line(f"Tracing {'enabled' if tracer.enabled else 'disabled'}.")
             continue
 
         try:
-            response = agent.chat(user_prompt=user_input)
+            for piece in agent.chat_stream(user_input):
+                console.reply(piece)
+            console.end_reply()
         except KeyboardInterrupt:
-            print("\n[request cancelled]")
+            console.line("[request cancelled]")
             continue
         except RuntimeError as error:
-            print(f"[error] {error}")
+            console.line(f"[error] {error}")
             continue
 
-        print(f"Agent: {response}")
-
-    print("Goodbye!")
+    console.line("Goodbye!")
 
 
 if __name__ == "__main__":
