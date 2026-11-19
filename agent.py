@@ -1,7 +1,7 @@
 """Conversational agent backed by a Gemini model."""
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
 from typing import Any
 
 from google import genai
@@ -101,21 +101,24 @@ class Agent:
         """Read-only snapshot of the conversation, oldest message first."""
         return tuple(self._history)
 
-    def chat(self, user_prompt: str) -> str:
-        """Send a message to the model and return its reply.
+    def chat_stream(self, user_prompt: str) -> Generator[str, None, None]:
+        """Send a message to the model and stream its reply as it is written.
 
         If the model requests tools, the agent runs them, sends their results
-        back, and returns the model's final answer.
+        back and keeps streaming, until the model answers without requesting
+        any tool. The stream contains all the text the model writes during the
+        turn, including any text written before a tool call.
 
         The whole turn (the message, any tool calls and results, and the reply)
-        is added to the history only if it completes, so a failed or cancelled
-        turn leaves the history unchanged.
+        is added to the history only once the stream is fully consumed: a
+        failed turn, or a stream the caller stops early (e.g. with Ctrl+C),
+        leaves the history unchanged.
 
         Args:
             user_prompt: The user's message.
 
-        Returns:
-            The text of the model's final reply (empty if it has no text).
+        Yields:
+            Pieces of the model's text, in order, as they arrive.
 
         Raises:
             RuntimeError: If a request fails, Gemini returns no candidates, or
@@ -130,7 +133,7 @@ class Agent:
         for iteration in range(1, self._max_iterations + 1):
             self._observer.on_model_request(iteration)
 
-            model_content = self._generate([*self._history, *turn])
+            model_content = yield from self._stream([*self._history, *turn])
             turn.append(model_content)
 
             function_calls = self._function_calls(model_content)
@@ -138,7 +141,7 @@ class Agent:
                 self._history.extend(turn)
 
                 self._observer.on_final_answer(iteration)
-                return self._text(model_content)
+                return
 
             tools_responses = [self._run_tool(call) for call in function_calls]
 
@@ -154,29 +157,73 @@ class Agent:
             "the model kept requesting tools"
         )
 
+    def chat(self, user_prompt: str) -> str:
+        """Send a message to the model and return its whole reply at once.
+
+        Same as ``chat_stream``, but waits for the end of the turn and returns
+        all the text the model wrote, joined.
+
+        Args:
+            user_prompt: The user's message.
+
+        Returns:
+            All the text the model wrote during the turn (empty if none).
+
+        Raises:
+            RuntimeError: If a request fails, Gemini returns no candidates, or
+                the model still requests tools after max_iterations calls.
+        """
+        return "".join(self.chat_stream(user_prompt))
+
     def reset(self) -> None:
         """Start a new conversation by clearing the history."""
         self._history.clear()
 
-    def _generate(self, contents: list[types.Content]) -> types.Content:
-        """Send contents to the model and return the model's response."""
+    def _stream(
+        self, contents: list[types.Content]
+    ) -> Generator[str, None, types.Content]:
+        """Stream the model's response to the contents.
+
+        Yields:
+            The text of the response, piece by piece, as it arrives.
+
+        Returns:
+            The complete model message. Its parts are kept exactly as received,
+            so that Gemini's thought signatures stay where the API expects them.
+
+        Raises:
+            RuntimeError: If the request fails, or if Gemini returns nothing
+                (the response may have been blocked).
+        """
+        parts: list[types.Part] = []
         try:
-            response = self._client.models.generate_content(
+            for chunk in self._client.models.generate_content_stream(
                 model=self._model,
                 contents=contents,
                 config=self._config,
-            )
+            ):
+                if (
+                    not chunk.candidates
+                    or chunk.candidates[0].content is None
+                    or not chunk.candidates[0].content.parts
+                ):
+                    continue
+
+                for part in chunk.candidates[0].content.parts:
+                    parts.append(part)
+                    if part.text:
+                        yield part.text
         except genai.errors.APIError as error:
             raise RuntimeError(f"Gemini request failed: {error}") from error
         except Exception as error:  # network, timeout... the SDK does not wrap them all
             raise RuntimeError(f"Gemini request failed: {error!r}") from error
 
-        if not response.candidates or response.candidates[0].content is None:
+        if not parts:
             raise RuntimeError(
                 "Gemini returned no candidates (response may have been blocked)"
             )
 
-        return response.candidates[0].content
+        return types.Content(role="model", parts=parts)
 
     def _run_tool(self, call: types.FunctionCall) -> types.Part:
         """Run a tool requested by the model.
@@ -216,7 +263,11 @@ class Agent:
 
         self._observer.on_tool_result(name, response, duration)
 
-        return types.Part.from_function_response(name=name, response=response)
+        return types.Part(
+            function_response=types.FunctionResponse(
+                id=call.id, name=name, response=response
+            )
+        )
 
     @staticmethod
     def _function_calls(content: types.Content) -> list[types.FunctionCall]:
@@ -224,8 +275,3 @@ class Agent:
         return [
             part.function_call for part in content.parts or [] if part.function_call
         ]
-
-    @staticmethod
-    def _text(content: types.Content) -> str:
-        """Return the concatenated text parts of a model message."""
-        return "".join(part.text for part in content.parts or [] if part.text)

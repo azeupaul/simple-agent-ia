@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from typing import Any, cast, override
 
 import pytest
@@ -7,22 +8,37 @@ from google.genai import errors, types
 from agent import Agent, AgentObserver
 from tools import tool
 
+# A scripted stream: the chunks Gemini sends for one model call. An exception
+# in the list is raised when the agent reaches it, like a network failure in
+# the middle of a stream.
+Stream = list[types.GenerateContentResponse | Exception]
+
 
 class FakeModels:
-    """Stands in for ``client.models``: replays scripted responses, records calls."""
+    """Stands in for ``client.models``: replays scripted streams, records calls.
+
+    Each scripted item is the answer to one model call: a whole stream, a single
+    response (sent as a one-chunk stream) or an exception (raised right away).
+    """
 
     def __init__(self) -> None:
-        self.responses: list[types.GenerateContentResponse | Exception] = []
+        self.responses: list[Stream | types.GenerateContentResponse | Exception] = []
         self.calls: list[list[types.Content]] = []
 
-    def generate_content(
+    def generate_content_stream(
         self, *, model: str, contents: list[types.Content], config: Any
-    ) -> types.GenerateContentResponse:
+    ) -> Iterator[types.GenerateContentResponse]:
         self.calls.append(list(contents))
-        response = self.responses.pop(0)
-        if isinstance(response, Exception):
-            raise response
-        return response
+        scripted = self.responses.pop(0)
+        stream = scripted if isinstance(scripted, list) else [scripted]
+        return self._replay(stream)
+
+    @staticmethod
+    def _replay(stream: Stream) -> Iterator[types.GenerateContentResponse]:
+        for chunk in stream:
+            if isinstance(chunk, Exception):
+                raise chunk
+            yield chunk
 
 
 class FakeClient:
@@ -42,8 +58,10 @@ def text(value: str) -> types.Part:
     return types.Part.from_text(text=value)
 
 
-def call(name: str, **args: Any) -> types.Part:
-    return types.Part.from_function_call(name=name, args=args)
+def call(name: str, *, call_id: str | None = None, **args: Any) -> types.Part:
+    return types.Part(
+        function_call=types.FunctionCall(id=call_id, name=name, args=args)
+    )
 
 
 def function_responses(content: types.Content) -> list[dict[str, Any] | None]:
@@ -144,9 +162,17 @@ def test_remembers_previous_turns(client: FakeClient, agent: Agent) -> None:
 def test_returns_an_empty_string_when_the_reply_has_no_text(
     client: FakeClient, agent: Agent
 ) -> None:
-    client.models.responses = [reply()]
+    # What Gemini actually sends: a part whose text is empty.
+    client.models.responses = [reply(text(""))]
 
     assert agent.chat("Hi") == ""
+
+
+def test_rejects_an_empty_stream(client: FakeClient, agent: Agent) -> None:
+    client.models.responses = [reply()]
+
+    with pytest.raises(RuntimeError, match="no candidates"):
+        agent.chat("Hi")
 
 
 def test_reset_clears_the_history(client: FakeClient, agent: Agent) -> None:
@@ -487,3 +513,84 @@ def test_notifies_a_declined_tool_without_duration(
         "answer after 2",
     ]
     assert observer.durations == [0.0]
+
+
+# Streaming
+
+
+def test_streams_the_text_piece_by_piece(client: FakeClient, agent: Agent) -> None:
+    client.models.responses = [
+        [reply(text("Hel")), reply(text("lo")), reply(text("!"))]
+    ]
+
+    assert list(agent.chat_stream("Hi")) == ["Hel", "lo", "!"]
+
+
+def test_chat_joins_the_streamed_text(client: FakeClient, agent: Agent) -> None:
+    client.models.responses = [[reply(text("Hel")), reply(text("lo!"))]]
+
+    assert agent.chat("Hi") == "Hello!"
+
+
+def test_streams_the_text_written_before_a_tool_call(
+    client: FakeClient, agent: Agent
+) -> None:
+    client.models.responses = [
+        [reply(text("Let me compute. ")), reply(call("add", a=2, b=3))],
+        reply(text("It is 5.")),
+    ]
+
+    assert list(agent.chat_stream("What is 2 + 3?")) == ["Let me compute. ", "It is 5."]
+
+
+def test_keeps_the_parts_exactly_as_received(client: FakeClient, agent: Agent) -> None:
+    # Gemini may send its thought signature in a last chunk with empty text.
+    signed = types.Part(text="", thought_signature=b"signature")
+    client.models.responses = [
+        [reply(call("add", a=2, b=3)), reply(signed)],
+        reply(text("It is 5.")),
+    ]
+
+    agent.chat("What is 2 + 3?")
+
+    model_message = client.models.calls[1][1]
+    assert model_message.parts == [call("add", a=2, b=3), signed]
+
+
+def test_sends_back_the_id_of_the_tool_call(client: FakeClient, agent: Agent) -> None:
+    client.models.responses = [
+        reply(call("add", call_id="call-1", a=2, b=3)),
+        reply(text("It is 5.")),
+    ]
+
+    agent.chat("What is 2 + 3?")
+
+    [part] = client.models.calls[1][-1].parts or []
+    assert part.function_response is not None
+    assert part.function_response.id == "call-1"
+
+
+def test_keeps_the_history_unchanged_when_the_stream_fails_midway(
+    client: FakeClient, agent: Agent
+) -> None:
+    client.models.responses = [[reply(text("Hel")), TimeoutError("network down")]]
+    received: list[str] = []
+
+    with pytest.raises(RuntimeError, match="Gemini request failed"):
+        for piece in agent.chat_stream("Hi"):
+            received.append(piece)
+
+    assert received == ["Hel"]
+    assert agent.history == ()
+
+
+def test_keeps_the_history_unchanged_when_the_caller_stops_early(
+    client: FakeClient, agent: Agent
+) -> None:
+    client.models.responses = [[reply(text("Hel")), reply(text("lo"))]]
+
+    stream = agent.chat_stream("Hi")
+    assert next(stream) == "Hel"
+    stream.close()  # what happens when the user presses Ctrl+C while reading
+
+    assert agent.history == ()
