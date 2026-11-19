@@ -4,7 +4,7 @@ A learning project to understand how an AI agent works by building one **without
 
 ## Features
 
-- Interactive chat in the terminal
+- Interactive chat in the terminal, with the reply streamed as it is written
 - Conversation memory: the whole history is sent to the model on each turn
 - Tool calling, handled manually: the model requests a tool, the agent runs it and sends the result back
 - Agent loop: the model can chain several tool calls in one turn, up to a maximum number of iterations
@@ -39,9 +39,23 @@ The model never runs anything itself: it only **requests** a tool, based on the 
 |---|---|
 | `agent.py` | `Agent`: keeps the history, calls Gemini, runs the requested tools |
 | `tools.py` | `Tool` base class, `@tool` decorator, `ToolRegistry` and the concrete tools |
-| `main.py` | Configuration and the terminal chat loop |
+| `main.py` | Configuration, the terminal chat loop and `Console`, which prints the streamed reply, traces and confirmations without mixing them |
 
 A turn is committed to the history only once it completes, so an API error or a `Ctrl+C` leaves the conversation unchanged.
+
+### Streaming
+
+`Agent.chat_stream()` is a generator: it yields the model's text piece by piece, as Gemini sends it, while the agent loop runs tool calls in between. `Agent.chat()` simply joins the stream.
+
+```python
+for piece in agent.chat_stream("What time is it in Tokyo?"):
+    print(piece, end="", flush=True)
+```
+
+- The stream contains all the text the model writes during the turn, including any text written before a tool call: the agent cannot know in advance whether a call will follow.
+- A turn is committed only once the stream is fully consumed. If the stream fails midway, or the caller stops reading it (`Ctrl+C`), the history is left unchanged.
+- The parts of each model message are stored **exactly as received**. Gemini 3 attaches *thought signatures* to some parts, sometimes to a last part with empty text, and the API requires them back in the same place. Merging the streamed text into one part would break that, so the pieces are joined only for display, in `/history`.
+- Tool results are sent back with the `id` of the call they answer.
 
 ### Tracing
 
@@ -178,7 +192,7 @@ uv run pre-commit run --all-files # run them manually
 
 The checks are `ruff format`, `ruff check`, `mypy` in strict mode and `pytest`. GitHub Actions runs the same hooks on every push and pull request.
 
-The tests never call Gemini: `tests/test_agent.py` replaces the client with a fake one that replays scripted responses, so they are free, fast and deterministic.
+The tests never call Gemini: `tests/test_agent.py` replaces the client with a fake one that replays scripted streams, including failures in the middle of a stream, so they are free, fast and deterministic.
 
 ## Roadmap
 
@@ -187,7 +201,11 @@ The tests never call Gemini: `tests/test_agent.py` replaces the client with a fa
 - [x] Agent loop: chain several tool calls, with a maximum number of iterations
 - [x] Tool registry and `@tool` decorator
 - [x] Tracing and human confirmation for sensitive tools
-- [ ] Going further: history summarization, planning, structured output, streaming
+- [ ] Going further
+  - [x] Streaming
+  - [ ] History summarization
+  - [ ] Structured output
+  - [ ] Planning
 
 ## Known limitations
 
