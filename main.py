@@ -119,11 +119,11 @@ class ConsoleTracer(AgentObserver):
         """Initialize the tracer.
 
         Args:
-            enabled: Whether to print events from the start.
             console: Where to print the events.
+            enabled: Whether to print events from the start.
         """
-        self.enabled = enabled
         self._console = console
+        self.enabled = enabled
 
     @override
     def on_model_request(self, iteration: int) -> None:
@@ -160,6 +160,41 @@ class ConsoleTracer(AgentObserver):
                 f"    <-- {prompt_tokens} tokens in, {output_tokens} out"
             )
 
+    @override
+    def on_history_summarized(self, summarized: int, kept: int) -> None:
+        """Print the number of messages replaced and kept after a summary."""
+        if self.enabled:
+            self._console.line(
+                f"    ~~> history summarized: {summarized} messages replaced, "
+                f"{kept} kept"
+            )
+
+    @override
+    def on_summary_failed(self, error: Exception) -> None:
+        """Print why the summary failed: the history is kept unchanged."""
+        if self.enabled:
+            self._console.line(
+                f"    ~~> summary failed: {error}, history kept unchanged"
+            )
+
+
+def read_max_context_tokens() -> int | None:
+    """Return MAX_CONTEXT_TOKENS from the environment, or None if it is unset.
+
+    Raises:
+        ValueError: If the variable is set but is not an integer.
+    """
+    raw = os.getenv("MAX_CONTEXT_TOKENS", "").strip()
+    if not raw:
+        return None
+
+    try:
+        return int(raw)
+    except ValueError as error:
+        raise ValueError(
+            f"MAX_CONTEXT_TOKENS must be an integer, got {raw!r}"
+        ) from error
+
 
 def main() -> None:
     """Run an interactive chat session with the agent in the terminal."""
@@ -167,13 +202,17 @@ def main() -> None:
 
     console = Console()
     tracer = ConsoleTracer(console=console)
-    agent = Agent(
-        client=genai.Client(),
-        model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-        tools=[CalculateTool(), get_current_time, write_note],
-        observer=tracer,
-        confirm=console.confirm,
-    )
+    try:
+        agent = Agent(
+            client=genai.Client(),
+            model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+            tools=[CalculateTool(), get_current_time, write_note],
+            observer=tracer,
+            confirm=console.confirm,
+            max_context_tokens=read_max_context_tokens(),
+        )
+    except ValueError as error:
+        raise SystemExit(f"[config error] {error}") from error
 
     console.line("Welcome to simple agent!")
     console.line("Available Commands:")
