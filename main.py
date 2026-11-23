@@ -179,6 +179,14 @@ class ConsoleTracer(AgentObserver):
                 f"    ~~> summary failed: {error}, history kept unchanged"
             )
 
+    @override
+    def on_invalid_reply(self, attempt: int, problems: str) -> None:
+        """Print why a structured reply was refused, before the next attempt."""
+        if self.enabled:
+            self._console.line(
+                f"    ~~> invalid reply (attempt {attempt}): {shorten(problems)}"
+            )
+
 
 def read_max_context_tokens() -> int | None:
     """Return MAX_CONTEXT_TOKENS from the environment, or None if it is unset.

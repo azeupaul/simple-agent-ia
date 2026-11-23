@@ -14,6 +14,7 @@ A learning project to understand how an AI agent works by building one **without
 - Live tracing of the agent loop with `/trace`: model calls, tool calls, results, durations and tokens
 - Conversation size in tokens with `/tokens`
 - History summarization: beyond a token threshold, the older turns are replaced by a summary
+- Structured output: information extracted from the conversation as validated Pydantic objects, such as the task list of `/tasks`, with the model fixing its own invalid replies
 - Human confirmation: sensitive tools run only after the user approves the exact call
 
 ### Available tools
@@ -41,6 +42,7 @@ The model never runs anything itself: it only **requests** a tool, based on the 
 |---|---|
 | `agent.py` | `Agent`: keeps the history, calls Gemini, runs the requested tools |
 | `tools.py` | `Tool` base class, `@tool` decorator, `ToolRegistry` and the concrete tools |
+| `tasks.py` | `Task` and `TaskList`, the Pydantic models of `/tasks` |
 | `main.py` | Configuration, the terminal chat loop and `Console`, which prints the streamed reply, traces and confirmations without mixing them |
 
 A turn is committed to the history only once it completes, so an API error or a `Ctrl+C` leaves the conversation unchanged.
@@ -75,7 +77,7 @@ The agent announces each step of its loop to an **observer** (`AgentObserver`), 
 
 Tracing shows the cost and the path of an answer, not only the answer: how many model calls it took, which tools were called with which arguments, and how many tokens each call consumed.
 
-The "in" count of a call is the whole prompt: the system instruction, the tool declarations and the history. It grows on every turn, because the whole conversation is sent again each time. The "out" count leaves out thinking tokens, which are billed but not kept in the history. `/tokens` shows the size of the conversation after the last call: its last prompt plus its reply.
+The "in" count of a call is the whole prompt: the system instruction, the tool declarations and the history. It grows on every turn, because the whole conversation is sent again each time. The "out" count leaves out thinking tokens, which are billed but not kept in the history. `/tokens` shows the size of the conversation after the last call: its last prompt plus its reply. The requests for a summary or an extraction show their tokens in the trace too, but do not change `/tokens`: they are not part of the conversation.
 
 ### History summarization
 
@@ -98,6 +100,39 @@ With `/trace`, a summary shows as:
 ```
 
 The threshold must be well above what a summary cannot remove: the fixed cost of the system instruction and tool declarations (about 500 tokens here) and the turns that are kept. Otherwise the conversation stays beyond it, and the agent summarizes again on every turn.
+
+### Structured output
+
+`Agent.extract()` asks the model a question about the conversation and gets the answer as a Pydantic object instead of free text, so that code can use it:
+
+```python
+task_list = agent.extract("List every task the user mentioned.", TaskList)
+for task in task_list.tasks:
+    print(task.priority, task.title, task.due)
+```
+
+```
+You: This week I really must send the report by Friday, and call the plumber.
+You: Oh, and if I have time, buy light bulbs.
+You: /tasks
+Tasks (3):
+  [high]   Send the report (Friday)
+  [medium] Call the plumber
+  [low]    Buy light bulbs
+```
+
+- The request sends the history, then the instruction, with `response_mime_type="application/json"` and the JSON Schema that Pydantic generates from the model (`model_json_schema()`). It uses no tools and is not added to the history: it is a question about the conversation, not a turn of it.
+- The reply is validated by hand with `model_validate_json`, rather than with the SDK's `response.parsed`, which returns `None` silently when the reply does not match.
+- The schema constrains the shape of the JSON, but not every Pydantic rule. When validation fails, the agent sends the model its own reply and the list of problems, and asks again, up to 3 attempts: the same idea as reporting tool errors to the model.
+- The field descriptions are part of the schema, so they are a prompt: "Use medium when the user gave no clue" is how the model picks a priority. A deadline is kept in the user's words (`"Friday"`), because the model does not know today's date and would have to make one up.
+
+With `/trace`, the tokens of each attempt and the rejected replies show:
+
+```
+    <-- 1180 tokens in, 52 out
+    ~~> invalid reply (attempt 1): tasks.0.priority: Input should be 'low', 'medium' or 'high'
+    <-- 1260 tokens in, 48 out
+```
 
 ### Confirmation of sensitive tools
 
@@ -139,6 +174,7 @@ The chat refuses to start if `MAX_CONTEXT_TOKENS` is not a positive integer.
 | `/history` | Show the conversation, including tool calls and results |
 | `/trace` | Turn tracing of the agent loop on or off |
 | `/tokens` | Show the size of the conversation in tokens |
+| `/tasks` | List the tasks mentioned in the conversation, most urgent first |
 | `/reset` | Start a new conversation |
 | `/quit`, `/exit`, `Ctrl+D` | Leave |
 | `Ctrl+C` | Cancel the current request, or leave at the prompt |
@@ -233,7 +269,7 @@ The tests never call Gemini: `tests/test_agent.py` replaces the client with a fa
 - [ ] Going further
   - [x] Streaming
   - [x] History summarization
-  - [ ] Structured output
+  - [x] Structured output
   - [ ] Planning
 
 ## Known limitations
@@ -241,7 +277,6 @@ The tests never call Gemini: `tests/test_agent.py` replaces the client with a fa
 - The model may request a call again after the user declined it in the same turn. Each run still needs a new approval, so nothing runs without consent, but the user may have to say no twice.
 - Note titles are case-sensitive on Linux: `Meeting` and `meeting` create two notes, while macOS and Windows treat them as the same file and refuse the second one.
 - The recent turns are kept by number, not by size. If they alone are beyond `MAX_CONTEXT_TOKENS`, for instance after a very long answer, a summary cannot bring the conversation back under it, and the agent summarizes again on every turn until that answer becomes an old turn.
-- The summary request is not counted in the trace's token counts, although it is billed.
 - Each summary of a summary can lose a little detail: what the model left out of the first summary is gone for good.
 
 ## License

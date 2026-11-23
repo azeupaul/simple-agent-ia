@@ -146,6 +146,10 @@ class RecordingObserver(AgentObserver):
         self.events.append(f"summarized {summarized}, kept {kept}")
 
     @override
+    def on_invalid_reply(self, attempt: int, problems: str) -> None:
+        self.events.append(f"invalid reply #{attempt}: {problems}")
+
+    @override
     def on_summary_failed(self, error: Exception) -> None:
         self.events.append(f"summary failed: {error}")
 
@@ -1093,3 +1097,41 @@ def test_extract_does_not_retry_a_failed_request(
 def test_extract_rejects_invalid_max_attempts(agent: Agent) -> None:
     with pytest.raises(ValueError, match="max_attempts must be at least 1"):
         agent.extract("Who is the user?", Person, max_attempts=0)
+
+
+def test_extract_reports_its_tokens_and_invalid_replies(
+    client: FakeClient, agent: Agent, observer: RecordingObserver
+) -> None:
+    client.models.generated = [
+        with_usage(reply(text('{"name": "Paul"}')), prompt=100, output=8, thoughts=5),
+        with_usage(
+            reply(text('{"name": "Paul", "age": 30}')),
+            prompt=130,
+            output=12,
+            thoughts=0,
+        ),
+    ]
+
+    agent.extract("Who is the user?", Person)
+
+    assert observer.events == [
+        "usage 100+8",
+        "invalid reply #1: age: Field required",
+        "usage 130+12",
+    ]
+    assert agent.context_tokens == 0  # an extraction is not part of the conversation
+
+
+def test_a_summary_reports_its_tokens(
+    client: FakeClient, observer: RecordingObserver
+) -> None:
+    agent = summarizing_agent(client, observer)
+    chat_turns(client, agent, 2)
+    client.models.generated = [
+        with_usage(summary("Earlier: 0 + 1 = 1."), prompt=300, output=20, thoughts=0)
+    ]
+
+    chat_big_turn(client, agent)
+
+    assert observer.events[-2:] == ["usage 300+20", "summarized 4, kept 6"]
+    assert agent.context_tokens == 1300  # still the chat's last call

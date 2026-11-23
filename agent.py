@@ -50,6 +50,9 @@ class AgentObserver:
     def on_summary_failed(self, error: Exception) -> None:
         """Called when the summary failed: the history is kept unchanged."""
 
+    def on_invalid_reply(self, attempt: int, problems: str) -> None:
+        """Called when a structured reply does not follow its schema."""
+
 
 class Agent:
     """A conversational agent that keeps the history of its exchanges with Gemini.
@@ -296,12 +299,13 @@ class Agent:
             types.Content(role="user", parts=[types.Part.from_text(text=instruction)]),
         ]
 
-        for _ in range(max_attempts):
+        for attempt in range(1, max_attempts + 1):
             reply = self._reply_content(self._generate(contents, config))
             try:
                 return schema.model_validate_json(self._text(reply))
             except ValidationError as error:
                 problems = _describe(error)
+                self._observer.on_invalid_reply(attempt, problems)
 
             # Show the model its own reply and what is wrong with it.
             contents += [
@@ -322,21 +326,33 @@ class Agent:
         )
 
     def _generate(
-        self, contents: list[types.Content], config: types.GenerateContentConfig
+        self,
+        contents: str | list[types.Content],
+        config: types.GenerateContentConfig,
     ) -> types.GenerateContentResponse:
-        """Send a request without streaming.
+        """Send a request without streaming, and report the tokens it consumed.
+
+        Unlike the chat, it does not change context_tokens: its contents are
+        not the conversation as it will be sent on the next turn.
 
         Raises:
             RuntimeError: If the request fails.
         """
         try:
-            return self._client.models.generate_content(
+            response = self._client.models.generate_content(
                 model=self._model, contents=contents, config=config
             )
         except genai.errors.APIError as error:
             raise RuntimeError(f"Gemini request failed: {error}") from error
         except Exception as error:  # network, timeout... the SDK does not wrap them all
             raise RuntimeError(f"Gemini request failed: {error!r}") from error
+
+        if usage := response.usage_metadata:
+            self._observer.on_usage(
+                prompt_tokens=usage.prompt_token_count or 0,
+                output_tokens=usage.candidates_token_count or 0,
+            )
+        return response
 
     @staticmethod
     def _reply_content(response: types.GenerateContentResponse) -> types.Content:
@@ -548,15 +564,14 @@ class Agent:
             return
 
         try:
-            response = self._client.models.generate_content(
-                model=self._model,
-                contents=self._transcript(old),
-                config=types.GenerateContentConfig(
+            response = self._generate(
+                self._transcript(old),
+                types.GenerateContentConfig(
                     system_instruction=self.SUMMARY_INSTRUCTION
                 ),
             )
             summary = response.text
-        except Exception as error:  # APIError, network... the turn must not fail
+        except RuntimeError as error:  # the turn itself must not fail
             self._observer.on_summary_failed(error)
             return
 
