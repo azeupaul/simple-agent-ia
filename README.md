@@ -11,7 +11,9 @@ A learning project to understand how an AI agent works by building one **without
 - Parallel tool calls in a single response
 - Tool errors are reported to the model, which can correct itself and retry
 - Conversation inspection with `/history`
-- Live tracing of the agent loop with `/trace`: model calls, tool calls, results and durations
+- Live tracing of the agent loop with `/trace`: model calls, tool calls, results, durations and tokens
+- Conversation size in tokens with `/tokens`
+- History summarization: beyond a token threshold, the older turns are replaced by a summary
 - Human confirmation: sensitive tools run only after the user approves the exact call
 
 ### Available tools
@@ -63,16 +65,39 @@ The agent announces each step of its loop to an **observer** (`AgentObserver`), 
 
 ```
     --> model call #1
-    --> get_current_time(timezone='Asia/Tokyo')
-    <-- {'result': '2026-11-17T01:35:06+09:00'} (7.0 ms)
+    <-- 546 tokens in, 22 out
+    --> get_current_time(timezone='Africa/Douala')
+    <-- {'result': '2026-11-23T16:09:24.951183+01:00'} (0.1 ms)
     --> model call #2
-    --> calculate(expression='24 * 60 - (1 * 60 + 35)')
-    <-- {'result': 1345} (0.2 ms)
-    --> model call #3
-    Answered after 3 model call(s)
+    <-- 614 tokens in, 19 out
+    Answered after 2 model call(s)
 ```
 
-Tracing shows the cost and the path of an answer, not only the answer: how many model calls it took, and which tools were called with which arguments.
+Tracing shows the cost and the path of an answer, not only the answer: how many model calls it took, which tools were called with which arguments, and how many tokens each call consumed.
+
+The "in" count of a call is the whole prompt: the system instruction, the tool declarations and the history. It grows on every turn, because the whole conversation is sent again each time. The "out" count leaves out thinking tokens, which are billed but not kept in the history. `/tokens` shows the size of the conversation after the last call: its last prompt plus its reply.
+
+### History summarization
+
+Since the whole history is sent on every turn, a long conversation gets slower, costs more, and would end up beyond the model's context window. When `MAX_CONTEXT_TOKENS` is set and the conversation grows beyond it, the agent replaces its older turns with a summary, at the end of the turn:
+
+```
+before:  [turn 1] [turn 2] [turn 3] [turn 4] [turn 5]
+after:   [summary of turns 1-3] [turn 4] [turn 5]
+```
+
+- The cut is always at the start of a turn, so a tool call is never separated from its result. The most recent turns, 2 by default (`keep_recent_turns`), are kept as they are.
+- The old turns are sent to the model as a plain-text transcript, in a separate request without tools, and replaced by two messages: the summary, as a user message, and a short acknowledgement from the model.
+- The summary counts as a turn. At the next summary, it becomes one of the old turns and is summarized again with them: the history always holds a single summary, never a pile of them.
+- The user's turn is already complete when the summary runs, so a failed summary never fails it. The history is kept unchanged, and the summary is tried again after the next turn.
+
+With `/trace`, a summary shows as:
+
+```
+    ~~> history summarized: 10 messages replaced, 6 kept
+```
+
+The threshold must be well above what a summary cannot remove: the fixed cost of the system instruction and tool declarations (about 500 tokens here) and the turns that are kept. Otherwise the conversation stays beyond it, and the agent summarizes again on every turn.
 
 ### Confirmation of sensitive tools
 
@@ -103,6 +128,9 @@ uv run main.py
 |---|---|---|
 | `GEMINI_API_KEY` | yes | |
 | `GEMINI_MODEL` | no | `gemini-3.5-flash-lite` |
+| `MAX_CONTEXT_TOKENS` | no | unset: the history is never summarized |
+
+The chat refuses to start if `MAX_CONTEXT_TOKENS` is not a positive integer.
 
 ### Commands
 
@@ -110,6 +138,7 @@ uv run main.py
 |---|---|
 | `/history` | Show the conversation, including tool calls and results |
 | `/trace` | Turn tracing of the agent loop on or off |
+| `/tokens` | Show the size of the conversation in tokens |
 | `/reset` | Start a new conversation |
 | `/quit`, `/exit`, `Ctrl+D` | Leave |
 | `Ctrl+C` | Cancel the current request, or leave at the prompt |
@@ -203,7 +232,7 @@ The tests never call Gemini: `tests/test_agent.py` replaces the client with a fa
 - [x] Tracing and human confirmation for sensitive tools
 - [ ] Going further
   - [x] Streaming
-  - [ ] History summarization
+  - [x] History summarization
   - [ ] Structured output
   - [ ] Planning
 
@@ -211,6 +240,9 @@ The tests never call Gemini: `tests/test_agent.py` replaces the client with a fa
 
 - The model may request a call again after the user declined it in the same turn. Each run still needs a new approval, so nothing runs without consent, but the user may have to say no twice.
 - Note titles are case-sensitive on Linux: `Meeting` and `meeting` create two notes, while macOS and Windows treat them as the same file and refuse the second one.
+- The recent turns are kept by number, not by size. If they alone are beyond `MAX_CONTEXT_TOKENS`, for instance after a very long answer, a summary cannot bring the conversation back under it, and the agent summarizes again on every turn until that answer becomes an old turn.
+- The summary request is not counted in the trace's token counts, although it is billed.
+- Each summary of a summary can lose a little detail: what the model left out of the first summary is gone for good.
 
 ## License
 
