@@ -8,6 +8,7 @@ from google import genai
 from google.genai import types
 
 from agent import Agent, AgentObserver
+from tasks import TaskList
 from tools import CalculateTool, get_current_time, write_note
 
 EXIT_COMMANDS = {"/quit", "/exit"}
@@ -15,6 +16,7 @@ RESET_COMMAND = "/reset"
 HISTORY_COMMAND = "/history"
 TRACER_COMMAND = "/trace"
 TOKEN_COMMAND = "/tokens"
+TASKS_COMMAND = "/tasks"
 MAX_DISPLAY_LENGTH = 80
 
 
@@ -196,6 +198,30 @@ def read_max_context_tokens() -> int | None:
         ) from error
 
 
+def show_tasks(agent: Agent, console: Console) -> None:
+    """Extract the tasks from the conversation and print them."""
+    if not agent.history:
+        console.line("[no conversation yet]")
+        return
+
+    try:
+        task_list = agent.extract(TaskList.INSTRUCTION, TaskList)
+    except KeyboardInterrupt:
+        console.line("[request cancelled]")
+        return
+    except RuntimeError as error:
+        console.line(f"[error] {error}")
+        return
+
+    if not task_list.tasks:
+        console.line("[no tasks found]")
+        return
+
+    console.line(f"Tasks ({len(task_list.tasks)}):")
+    for line in task_list.lines():
+        console.line(f"  {line}")
+
+
 def main() -> None:
     """Run an interactive chat session with the agent in the terminal."""
     load_dotenv()
@@ -219,6 +245,7 @@ def main() -> None:
     console.line(" - /history to view the conversation history")
     console.line(" - /trace to enable or disable traces")
     console.line(" - /tokens to show the size of the conversation in tokens")
+    console.line(" - /tasks to list the tasks mentioned in the conversation")
     console.line(" - /reset to start a new conversation")
     console.line(" - /quit or /exit to end the session")
     console.line("Type your message and press Enter to send it.\n")
@@ -259,6 +286,10 @@ def main() -> None:
 
         if command == TOKEN_COMMAND:
             console.line(f"Conversation size: {agent.context_tokens} tokens.")
+            continue
+
+        if command == TASKS_COMMAND:
+            show_tasks(agent, console)
             continue
 
         try:
