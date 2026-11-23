@@ -676,3 +676,124 @@ def test_works_without_token_counts(client: FakeClient, agent: Agent) -> None:
 
     assert agent.chat("Hi") == "Hello"
     assert agent.context_tokens == 0
+
+
+# History splitting (before summarizing)
+
+
+def user_says(value: str) -> types.Content:
+    return types.Content(role="user", parts=[text(value)])
+
+
+def model_says(*parts: types.Part) -> types.Content:
+    return types.Content(role="model", parts=list(parts))
+
+
+def tool_results(*responses: dict[str, Any]) -> types.Content:
+    return types.Content(
+        role="user",
+        parts=[
+            types.Part.from_function_response(name="add", response=r) for r in responses
+        ],
+    )
+
+
+def test_turn_starts_skip_tool_results() -> None:
+    history = [
+        user_says("Hi"),  # 0: turn 1
+        model_says(text("Hello")),
+        user_says("What is 2 + 3?"),  # 2: turn 2
+        model_says(call("add", a=2, b=3)),
+        tool_results({"result": 5}),  # a user message, but not a new turn
+        model_says(text("It is 5.")),
+    ]
+
+    assert Agent._turn_starts(history) == [0, 2]
+
+
+def chat_turns(client: FakeClient, agent: Agent, count: int) -> None:
+    """Play `count` turns, each with a tool call, to build a real history."""
+    for index in range(count):
+        client.models.responses = [
+            reply(call("add", a=index, b=1)),
+            reply(text(f"It is {index + 1}.")),
+        ]
+        agent.chat(f"What is {index} + 1?")
+
+
+def test_split_history_keeps_the_most_recent_turns(
+    client: FakeClient, agent: Agent
+) -> None:
+    chat_turns(client, agent, 4)  # 4 turns of 4 messages each
+
+    old, recent = agent._split_history()
+
+    assert len(old) == 8  # turns 1 and 2
+    assert len(recent) == 8  # turns 3 and 4, kept by default
+    assert recent[0].parts == [text("What is 2 + 1?")]
+    assert old + recent == list(agent.history)
+
+
+def test_split_history_never_separates_a_call_from_its_result(
+    client: FakeClient, agent: Agent
+) -> None:
+    chat_turns(client, agent, 3)
+
+    old, recent = agent._split_history()
+
+    # Both parts start with the user's text and end with the model's answer.
+    for part in (old, recent):
+        assert Agent._turn_starts(part)[0] == 0
+        assert part[-1].role == "model"
+        assert not Agent._function_calls(part[-1])
+
+
+def test_split_history_has_nothing_to_summarize_with_few_turns(
+    client: FakeClient, agent: Agent
+) -> None:
+    chat_turns(client, agent, 2)
+
+    old, recent = agent._split_history()
+
+    assert old == []
+    assert recent == list(agent.history)
+
+
+def test_split_history_of_an_empty_history(agent: Agent) -> None:
+    assert agent._split_history() == ([], [])
+
+
+@pytest.mark.parametrize(
+    ("max_context_tokens", "keep_recent_turns"),
+    [(0, 2), (-1, 2), (1000, 0)],
+)
+def test_rejects_invalid_summary_settings(
+    client: FakeClient, max_context_tokens: int, keep_recent_turns: int
+) -> None:
+    with pytest.raises(ValueError, match="must be at least 1"):
+        Agent(
+            cast(genai.Client, client),
+            model="fake-model",
+            max_context_tokens=max_context_tokens,
+            keep_recent_turns=keep_recent_turns,
+        )
+
+
+@pytest.mark.parametrize(
+    ("max_context_tokens", "expected"),
+    [(None, False), (200, False), (150, False), (149, True)],
+)
+def test_should_summarize_only_beyond_the_threshold(
+    client: FakeClient, max_context_tokens: int | None, expected: bool
+) -> None:
+    agent = Agent(
+        cast(genai.Client, client),
+        model="fake-model",
+        max_context_tokens=max_context_tokens,
+    )
+    client.models.responses = [
+        with_usage(reply(text("Hello")), prompt=120, output=30, thoughts=0)
+    ]
+    agent.chat("Hi")  # 150 tokens of context
+
+    assert agent._should_summarize() is expected

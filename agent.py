@@ -64,6 +64,8 @@ class Agent:
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         observer: AgentObserver | None = None,
         confirm: Callable[[types.FunctionCall], bool] | None = None,
+        max_context_tokens: int | None = None,
+        keep_recent_turns: int = 2,
     ) -> None:
         """Initialize the agent with an empty conversation.
 
@@ -78,12 +80,29 @@ class Agent:
                 Defaults to an observer that does nothing.
             confirm: Asks the user whether a sensitive tool may run, and returns True
                 to allow it. By default, every sensitive tool is refused.
+            max_context_tokens: When the conversation grows beyond this many
+                tokens, its older turns are summarized after the current turn.
+                None (the default) never summarizes.
+            keep_recent_turns: Number of most recent turns kept as they are when
+                the history is summarized.
 
         Raises:
-            ValueError: If max_iterations is less than 1.
+            ValueError: If max_iterations, max_context_tokens (when given) or
+                keep_recent_turns is less than 1.
         """
         if max_iterations < 1:
             raise ValueError(f"max_iterations must be at least 1, got {max_iterations}")
+
+        if max_context_tokens is not None and max_context_tokens < 1:
+            raise ValueError(
+                "max_context_tokens must be at least 1 when defined, "
+                f"got {max_context_tokens}"
+            )
+
+        if keep_recent_turns < 1:
+            raise ValueError(
+                f"keep_recent_turns must be at least 1, got {keep_recent_turns}"
+            )
 
         self._client = client
         self._model = model
@@ -99,6 +118,8 @@ class Agent:
         self._observer = observer or AgentObserver()
         self._confirm = confirm or _deny
         self._context_tokens: int = 0
+        self._max_context_tokens = max_context_tokens
+        self._keep_recent_turns = keep_recent_turns
 
     @property
     def history(self) -> tuple[types.Content, ...]:
@@ -154,6 +175,9 @@ class Agent:
                 self._history.extend(turn)
 
                 self._observer.on_final_answer(iteration)
+
+                if self._should_summarize():
+                    self._summarize_history()
                 return
 
             tools_responses = [self._run_tool(call) for call in function_calls]
@@ -304,3 +328,43 @@ class Agent:
         return [
             part.function_call for part in content.parts or [] if part.function_call
         ]
+
+    @staticmethod
+    def _turn_starts(history: Sequence[types.Content]) -> list[int]:
+        """Return the index of the first message of each turn.
+
+        A turn starts with a user message that contains text. Tool results are
+        also sent with the "user" role, but they only contain function responses.
+        """
+        return [
+            index
+            for index, content in enumerate(history)
+            if content.role == "user" and any(part.text for part in content.parts or [])
+        ]
+
+    def _split_history(self) -> tuple[list[types.Content], list[types.Content]]:
+        """Split the history into old turns to summarize and recent turns to keep.
+
+        The cut is always at the start of a turn, so a tool call is never
+        separated from its result.
+
+        Returns:
+            The old messages and the recent ones. The old part is empty when
+            the history has no more than ``keep_recent_turns`` turns.
+        """
+        starts = self._turn_starts(self._history)
+        if len(starts) <= self._keep_recent_turns:
+            return [], list(self._history)
+
+        cut = starts[-self._keep_recent_turns]
+        return self._history[:cut], self._history[cut:]
+
+    def _should_summarize(self) -> bool:
+        """Return True if the conversation has grown beyond max_context_tokens."""
+        return (
+            self._max_context_tokens is not None
+            and self._context_tokens > self._max_context_tokens
+        )
+
+    def _summarize_history(self) -> None:
+        """Replace the old turns of the history with a summary (step C)."""
