@@ -24,6 +24,18 @@ class FakeModels:
     def __init__(self) -> None:
         self.responses: list[Stream | types.GenerateContentResponse | Exception] = []
         self.calls: list[list[types.Content]] = []
+        # Non-streamed calls, used for the summaries: their own script and record.
+        self.summaries: list[types.GenerateContentResponse | Exception] = []
+        self.summary_requests: list[tuple[str, types.GenerateContentConfig]] = []
+
+    def generate_content(
+        self, *, model: str, contents: str, config: types.GenerateContentConfig
+    ) -> types.GenerateContentResponse:
+        self.summary_requests.append((contents, config))
+        scripted = self.summaries.pop(0)
+        if isinstance(scripted, Exception):
+            raise scripted
+        return scripted
 
     def generate_content_stream(
         self, *, model: str, contents: list[types.Content], config: Any
@@ -121,6 +133,14 @@ class RecordingObserver(AgentObserver):
     @override
     def on_usage(self, prompt_tokens: int, output_tokens: int) -> None:
         self.events.append(f"usage {prompt_tokens}+{output_tokens}")
+
+    @override
+    def on_history_summarized(self, summarized: int, kept: int) -> None:
+        self.events.append(f"summarized {summarized}, kept {kept}")
+
+    @override
+    def on_summary_failed(self, error: Exception) -> None:
+        self.events.append(f"summary failed: {error}")
 
 
 @pytest.fixture
@@ -797,3 +817,158 @@ def test_should_summarize_only_beyond_the_threshold(
     agent.chat("Hi")  # 150 tokens of context
 
     assert agent._should_summarize() is expected
+
+
+# History summarization
+
+
+def test_transcript_renders_texts_calls_and_results() -> None:
+    history = [
+        user_says("What is 2 + 3?"),
+        model_says(call("add", a=2, b=3)),
+        tool_results({"result": 5}),
+        model_says(text("It is 5."), text("")),  # the empty signed part is skipped
+    ]
+
+    assert Agent._transcript(history) == (
+        "User: What is 2 + 3?\n"
+        "Tool call: add({'a': 2, 'b': 3})\n"
+        "Tool result: add -> {'result': 5}\n"
+        "Assistant: It is 5."
+    )
+
+
+def summary(value: str) -> types.GenerateContentResponse:
+    return reply(text(value))
+
+
+def summarizing_agent(client: FakeClient, observer: RecordingObserver) -> Agent:
+    return Agent(
+        cast(genai.Client, client),
+        model="fake-model",
+        tools=[add],
+        observer=observer,
+        max_context_tokens=1000,
+    )
+
+
+def chat_big_turn(client: FakeClient, agent: Agent) -> None:
+    """Play a turn that brings the conversation beyond 1000 tokens."""
+    client.models.responses = [
+        with_usage(reply(text("A long answer.")), prompt=1200, output=100, thoughts=0)
+    ]
+    agent.chat("Tell me more.")
+
+
+def test_summarizes_the_old_turns_beyond_the_threshold(
+    client: FakeClient, observer: RecordingObserver
+) -> None:
+    agent = summarizing_agent(client, observer)
+    chat_turns(client, agent, 2)
+    recent = list(agent.history[4:])  # turn 2, kept with the big turn 3
+    old = list(agent.history[:4])
+    client.models.summaries = [summary("0 + 1 is 1.")]
+
+    chat_big_turn(client, agent)
+
+    assert agent.history[0].parts == [
+        text("Summary of the earlier conversation:\n0 + 1 is 1.")
+    ]
+    assert agent.history[1].role == "model"
+    assert list(agent.history[2:6]) == recent
+    assert agent.history[6].parts == [text("Tell me more.")]
+    assert observer.events[-1] == "summarized 4, kept 6"
+
+    [(transcript, config)] = client.models.summary_requests
+    assert transcript == Agent._transcript(old)
+    assert config.system_instruction == Agent.SUMMARY_INSTRUCTION
+    assert config.tools is None  # the summary must not call tools
+
+
+def test_sends_the_summary_to_the_model_on_the_next_turn(
+    client: FakeClient, observer: RecordingObserver
+) -> None:
+    agent = summarizing_agent(client, observer)
+    chat_turns(client, agent, 2)
+    client.models.summaries = [summary("Earlier: 0 + 1 = 1.")]
+    chat_big_turn(client, agent)
+    client.models.responses = [reply(text("Sure."))]
+
+    agent.chat("And then?")
+
+    sent = client.models.calls[-1]
+    assert sent[0].parts == [
+        text("Summary of the earlier conversation:\nEarlier: 0 + 1 = 1.")
+    ]
+    assert sent[-1].parts == [text("And then?")]
+
+
+def test_does_not_summarize_below_the_threshold(
+    client: FakeClient, observer: RecordingObserver
+) -> None:
+    agent = summarizing_agent(client, observer)
+
+    chat_turns(client, agent, 3)  # no token counts: the context stays at 0
+
+    assert client.models.summary_requests == []
+    assert len(agent.history) == 12
+
+
+def test_does_not_summarize_when_there_are_few_turns(
+    client: FakeClient, observer: RecordingObserver
+) -> None:
+    agent = summarizing_agent(client, observer)
+    chat_turns(client, agent, 1)
+
+    chat_big_turn(client, agent)  # beyond the threshold, but only 2 turns
+
+    assert client.models.summary_requests == []
+    assert len(agent.history) == 6
+
+
+@pytest.mark.parametrize(
+    ("scripted", "error"),
+    [
+        (errors.APIError(503, {}), "503"),
+        (TimeoutError("too slow"), "too slow"),
+        (summary(""), "empty summary"),
+    ],
+    ids=["api-error", "network-error", "empty-summary"],
+)
+def test_keeps_the_history_when_the_summary_fails(
+    client: FakeClient,
+    observer: RecordingObserver,
+    scripted: types.GenerateContentResponse | Exception,
+    error: str,
+) -> None:
+    agent = summarizing_agent(client, observer)
+    chat_turns(client, agent, 2)
+    client.models.summaries = [scripted]
+
+    chat_big_turn(client, agent)  # the turn itself succeeds
+
+    assert len(agent.history) == 10  # nothing was replaced
+    assert agent.history[-1].parts == [text("A long answer.")]
+    assert observer.events[-1].startswith("summary failed")
+    assert error in observer.events[-1]
+
+
+def test_a_summary_is_summarized_again_with_the_next_old_turns(
+    client: FakeClient, observer: RecordingObserver
+) -> None:
+    agent = summarizing_agent(client, observer)
+    chat_turns(client, agent, 2)
+    client.models.summaries = [summary("First summary."), summary("Second summary.")]
+    chat_big_turn(client, agent)
+
+    chat_big_turn(client, agent)
+
+    # The first summary is a user message with text, so it counts as a turn:
+    # it becomes part of the old turns, and the new summary includes it.
+    transcript, _ = client.models.summary_requests[-1]
+    assert transcript.startswith(
+        "User: Summary of the earlier conversation:\nFirst summary."
+    )
+    assert agent.history[0].parts == [
+        text("Summary of the earlier conversation:\nSecond summary.")
+    ]

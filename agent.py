@@ -35,6 +35,12 @@ class AgentObserver:
     def on_usage(self, prompt_tokens: int, output_tokens: int) -> None:
         """Called after each model call, with the tokens it consumed."""
 
+    def on_history_summarized(self, summarized: int, kept: int) -> None:
+        """Called when old messages were replaced by a summary."""
+
+    def on_summary_failed(self, error: Exception) -> None:
+        """Called when the summary failed: the history is kept unchanged."""
+
 
 class Agent:
     """A conversational agent that keeps the history of its exchanges with Gemini.
@@ -53,6 +59,18 @@ class Agent:
     )
 
     DEFAULT_MAX_ITERATIONS = 10
+
+    SUMMARY_INSTRUCTION = (
+        "You summarize a conversation between a user and an assistant, so that "
+        "the assistant can go on with it without the original messages.\n"
+        "Keep every fact, decision, name, number and open question that may "
+        "matter later, including what the tools returned. Leave out greetings "
+        "and small talk.\n"
+        "Write in the language of the conversation, as short paragraphs or "
+        "bullet points. Reply with the summary only."
+    )
+
+    SUMMARY_PREFIX = "Summary of the earlier conversation:\n"
 
     def __init__(
         self,
@@ -366,5 +384,72 @@ class Agent:
             and self._context_tokens > self._max_context_tokens
         )
 
+    @staticmethod
+    def _transcript(contents: Sequence[types.Content]) -> str:
+        """Render messages as plain text, one line per text, tool call or result.
+
+        Empty texts (the parts that only carry a thought signature) are skipped.
+        """
+        lines = []
+        for content in contents:
+            speaker = "Assistant" if content.role == "model" else "User"
+            for part in content.parts or []:
+                if part.text:
+                    lines.append(f"{speaker}: {part.text}")
+                elif part.function_call:
+                    call = part.function_call
+                    lines.append(f"Tool call: {call.name}({call.args or {}})")
+                elif part.function_response:
+                    result = part.function_response
+                    lines.append(f"Tool result: {result.name} -> {result.response}")
+        return "\n".join(lines)
+
     def _summarize_history(self) -> None:
-        """Replace the old turns of the history with a summary (step C)."""
+        """Replace the old turns of the history with a summary.
+
+        The old turns are sent to the model as a plain-text transcript, in a
+        separate request without tools, and replaced by a pair of messages: the
+        summary, then a short acknowledgement from the model. The most recent
+        turns are kept as they are.
+
+        This method never raises: the user's turn is already complete, so if
+        the summary fails, the history is kept unchanged and the summary will
+        be tried again after the next turn.
+        """
+        old, recent = self._split_history()
+        if not old:
+            return
+
+        try:
+            response = self._client.models.generate_content(
+                model=self._model,
+                contents=self._transcript(old),
+                config=types.GenerateContentConfig(
+                    system_instruction=self.SUMMARY_INSTRUCTION
+                ),
+            )
+            summary = response.text
+        except Exception as error:  # APIError, network... the turn must not fail
+            self._observer.on_summary_failed(error)
+            return
+
+        if not summary:
+            self._observer.on_summary_failed(
+                RuntimeError("Gemini returned an empty summary")
+            )
+            return
+
+        self._history = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=self.SUMMARY_PREFIX + summary)],
+            ),
+            types.Content(
+                role="model",
+                parts=[
+                    types.Part.from_text(text="Understood, I will keep it in mind.")
+                ],
+            ),
+            *recent,
+        ]
+        self._observer.on_history_summarized(summarized=len(old), kept=len(recent))
