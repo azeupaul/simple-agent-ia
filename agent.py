@@ -6,6 +6,7 @@ from typing import Any
 
 from google import genai
 from google.genai import types
+from pydantic import BaseModel, ValidationError
 
 from tools import Tool, ToolRegistry
 
@@ -13,6 +14,14 @@ from tools import Tool, ToolRegistry
 def _deny(call: types.FunctionCall) -> bool:
     """Refuse every sensitive tool: the default when no confirm is given."""
     return False
+
+
+def _describe(error: ValidationError) -> str:
+    """Return one short line per validation error, e.g. "tasks.0.priority: ..."."""
+    return "\n".join(
+        f"{'.'.join(str(loc) for loc in detail['loc']) or 'reply'}: {detail['msg']}"
+        for detail in error.errors()
+    )
 
 
 class AgentObserver:
@@ -71,6 +80,15 @@ class Agent:
     )
 
     SUMMARY_PREFIX = "Summary of the earlier conversation:\n"
+
+    EXTRACT_INSTRUCTION = (
+        "You extract information from the conversation into JSON that follows "
+        "the given schema.\n"
+        "Use only what the conversation says: never make anything up. When a "
+        "value is not given, leave it empty if the schema allows it."
+    )
+
+    DEFAULT_MAX_EXTRACT_ATTEMPTS = 3
 
     def __init__(
         self,
@@ -234,6 +252,115 @@ class Agent:
         """Start a new conversation by clearing the history."""
         self._history.clear()
         self._context_tokens = 0
+
+    def extract[T: BaseModel](
+        self,
+        instruction: str,
+        schema: type[T],
+        *,
+        max_attempts: int = DEFAULT_MAX_EXTRACT_ATTEMPTS,
+    ) -> T:
+        """Extract structured information from the conversation.
+
+        The model answers with JSON that follows the schema, which is then
+        validated with Pydantic. If the reply is not valid, the validation
+        errors are sent back to the model, which gets another attempt.
+
+        The request uses the history as context, without tools, and is not
+        added to the history: it is a question about the conversation, not a
+        turn of it.
+
+        Args:
+            instruction: What to extract, e.g. "List the tasks I mentioned."
+            schema: The Pydantic model the reply must follow.
+            max_attempts: Maximum number of requests, the first one included.
+
+        Returns:
+            The validated reply, as an instance of the schema.
+
+        Raises:
+            ValueError: If max_attempts is less than 1.
+            RuntimeError: If a request fails, or if the reply is still invalid
+                after max_attempts requests.
+        """
+        if max_attempts < 1:
+            raise ValueError(f"max_attempts must be at least 1, got {max_attempts}")
+
+        config = types.GenerateContentConfig(
+            system_instruction=self.EXTRACT_INSTRUCTION,
+            response_mime_type="application/json",
+            response_json_schema=schema.model_json_schema(),
+        )
+        contents = [
+            *self._history,
+            types.Content(role="user", parts=[types.Part.from_text(text=instruction)]),
+        ]
+
+        for _ in range(max_attempts):
+            reply = self._reply_content(self._generate(contents, config))
+            try:
+                return schema.model_validate_json(self._text(reply))
+            except ValidationError as error:
+                problems = _describe(error)
+
+            # Show the model its own reply and what is wrong with it.
+            contents += [
+                reply,
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_text(
+                            text="Your reply does not follow the schema:\n"
+                            f"{problems}\nReply again with the corrected JSON only."
+                        )
+                    ],
+                ),
+            ]
+
+        raise RuntimeError(
+            f"No valid reply within {max_attempts} attempt(s):\n{problems}"
+        )
+
+    def _generate(
+        self, contents: list[types.Content], config: types.GenerateContentConfig
+    ) -> types.GenerateContentResponse:
+        """Send a request without streaming.
+
+        Raises:
+            RuntimeError: If the request fails.
+        """
+        try:
+            return self._client.models.generate_content(
+                model=self._model, contents=contents, config=config
+            )
+        except genai.errors.APIError as error:
+            raise RuntimeError(f"Gemini request failed: {error}") from error
+        except Exception as error:  # network, timeout... the SDK does not wrap them all
+            raise RuntimeError(f"Gemini request failed: {error!r}") from error
+
+    @staticmethod
+    def _reply_content(response: types.GenerateContentResponse) -> types.Content:
+        """Return the model message of a response, with its parts as received.
+
+        The parts are kept as they are, so that thought signatures stay where
+        the API expects them.
+
+        Raises:
+            RuntimeError: If Gemini returned nothing (the reply may have been
+                blocked).
+        """
+        if not response.candidates or not response.candidates[0].content:
+            raise RuntimeError(
+                "Gemini returned no candidates (response may have been blocked)"
+            )
+        return response.candidates[0].content
+
+    @staticmethod
+    def _text(content: types.Content) -> str:
+        """Return the text of a message, without its thoughts."""
+        return "".join(
+            part.text for part in content.parts or [] if part.text and not part.thought
+        )
 
     def _stream(
         self, contents: list[types.Content]

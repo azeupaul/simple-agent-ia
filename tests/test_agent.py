@@ -4,6 +4,7 @@ from typing import Any, cast, override
 import pytest
 from google import genai
 from google.genai import errors, types
+from pydantic import BaseModel, Field
 
 from agent import Agent, AgentObserver
 from tools import tool
@@ -24,15 +25,21 @@ class FakeModels:
     def __init__(self) -> None:
         self.responses: list[Stream | types.GenerateContentResponse | Exception] = []
         self.calls: list[list[types.Content]] = []
-        # Non-streamed calls, used for the summaries: their own script and record.
-        self.summaries: list[types.GenerateContentResponse | Exception] = []
-        self.summary_requests: list[tuple[str, types.GenerateContentConfig]] = []
+        # Non-streamed calls (summaries, extractions): their own script and record.
+        self.generated: list[types.GenerateContentResponse | Exception] = []
+        self.generate_requests: list[
+            tuple[str | list[types.Content], types.GenerateContentConfig]
+        ] = []
 
     def generate_content(
-        self, *, model: str, contents: str, config: types.GenerateContentConfig
+        self,
+        *,
+        model: str,
+        contents: str | list[types.Content],
+        config: types.GenerateContentConfig,
     ) -> types.GenerateContentResponse:
-        self.summary_requests.append((contents, config))
-        scripted = self.summaries.pop(0)
+        self.generate_requests.append((contents, config))
+        scripted = self.generated.pop(0)
         if isinstance(scripted, Exception):
             raise scripted
         return scripted
@@ -867,7 +874,7 @@ def test_summarizes_the_old_turns_beyond_the_threshold(
     chat_turns(client, agent, 2)
     recent = list(agent.history[4:])  # turn 2, kept with the big turn 3
     old = list(agent.history[:4])
-    client.models.summaries = [summary("0 + 1 is 1.")]
+    client.models.generated = [summary("0 + 1 is 1.")]
 
     chat_big_turn(client, agent)
 
@@ -879,7 +886,7 @@ def test_summarizes_the_old_turns_beyond_the_threshold(
     assert agent.history[6].parts == [text("Tell me more.")]
     assert observer.events[-1] == "summarized 4, kept 6"
 
-    [(transcript, config)] = client.models.summary_requests
+    [(transcript, config)] = client.models.generate_requests
     assert transcript == Agent._transcript(old)
     assert config.system_instruction == Agent.SUMMARY_INSTRUCTION
     assert config.tools is None  # the summary must not call tools
@@ -890,7 +897,7 @@ def test_sends_the_summary_to_the_model_on_the_next_turn(
 ) -> None:
     agent = summarizing_agent(client, observer)
     chat_turns(client, agent, 2)
-    client.models.summaries = [summary("Earlier: 0 + 1 = 1.")]
+    client.models.generated = [summary("Earlier: 0 + 1 = 1.")]
     chat_big_turn(client, agent)
     client.models.responses = [reply(text("Sure."))]
 
@@ -910,7 +917,7 @@ def test_does_not_summarize_below_the_threshold(
 
     chat_turns(client, agent, 3)  # no token counts: the context stays at 0
 
-    assert client.models.summary_requests == []
+    assert client.models.generate_requests == []
     assert len(agent.history) == 12
 
 
@@ -922,7 +929,7 @@ def test_does_not_summarize_when_there_are_few_turns(
 
     chat_big_turn(client, agent)  # beyond the threshold, but only 2 turns
 
-    assert client.models.summary_requests == []
+    assert client.models.generate_requests == []
     assert len(agent.history) == 6
 
 
@@ -943,7 +950,7 @@ def test_keeps_the_history_when_the_summary_fails(
 ) -> None:
     agent = summarizing_agent(client, observer)
     chat_turns(client, agent, 2)
-    client.models.summaries = [scripted]
+    client.models.generated = [scripted]
 
     chat_big_turn(client, agent)  # the turn itself succeeds
 
@@ -958,17 +965,131 @@ def test_a_summary_is_summarized_again_with_the_next_old_turns(
 ) -> None:
     agent = summarizing_agent(client, observer)
     chat_turns(client, agent, 2)
-    client.models.summaries = [summary("First summary."), summary("Second summary.")]
+    client.models.generated = [summary("First summary."), summary("Second summary.")]
     chat_big_turn(client, agent)
 
     chat_big_turn(client, agent)
 
     # The first summary is a user message with text, so it counts as a turn:
     # it becomes part of the old turns, and the new summary includes it.
-    transcript, _ = client.models.summary_requests[-1]
+    transcript, _ = client.models.generate_requests[-1]
+    assert isinstance(transcript, str)
     assert transcript.startswith(
         "User: Summary of the earlier conversation:\nFirst summary."
     )
     assert agent.history[0].parts == [
         text("Summary of the earlier conversation:\nSecond summary.")
     ]
+
+
+# Structured output
+
+
+class Person(BaseModel):
+    name: str
+    age: int = Field(ge=0)
+
+
+def test_extract_returns_a_validated_object(client: FakeClient, agent: Agent) -> None:
+    client.models.generated = [reply(text('{"name": "Paul", "age": 30}'))]
+
+    person = agent.extract("Who is the user?", Person)
+
+    assert person == Person(name="Paul", age=30)
+
+
+def test_extract_sends_the_history_and_the_schema(
+    client: FakeClient, agent: Agent
+) -> None:
+    client.models.responses = [reply(text("Hello Paul!"))]
+    agent.chat("Hi, I am Paul, 30 years old.")
+    client.models.generated = [reply(text('{"name": "Paul", "age": 30}'))]
+
+    agent.extract("Who is the user?", Person)
+
+    [(contents, config)] = client.models.generate_requests
+    assert contents == [*agent.history, user_says("Who is the user?")]
+    assert config.system_instruction == Agent.EXTRACT_INSTRUCTION
+    assert config.response_mime_type == "application/json"
+    assert config.response_json_schema == Person.model_json_schema()
+    assert config.tools is None
+
+
+def test_extract_does_not_change_the_history(client: FakeClient, agent: Agent) -> None:
+    client.models.responses = [reply(text("Hello Paul!"))]
+    agent.chat("Hi, I am Paul.")
+    history = agent.history
+    client.models.generated = [reply(text('{"name": "Paul", "age": 30}'))]
+
+    agent.extract("Who is the user?", Person)
+
+    assert agent.history == history
+
+
+@pytest.mark.parametrize(
+    ("invalid", "problem"),
+    [
+        ("Paul is 30.", "reply: Invalid JSON"),
+        ('{"name": "Paul"}', "age: Field required"),
+        ('{"name": "Paul", "age": -3}', "age: Input should be greater than or equal"),
+    ],
+    ids=["not-json", "missing-field", "constraint"],
+)
+def test_extract_sends_the_validation_errors_back_to_the_model(
+    client: FakeClient, agent: Agent, invalid: str, problem: str
+) -> None:
+    client.models.generated = [
+        reply(text(invalid)),
+        reply(text('{"name": "Paul", "age": 30}')),
+    ]
+
+    person = agent.extract("Who is the user?", Person)
+
+    assert person == Person(name="Paul", age=30)
+    contents, _ = client.models.generate_requests[1]
+    assert isinstance(contents, list)
+    *_, model_reply, correction = contents
+    assert model_reply == model_says(text(invalid))  # its own reply, as received
+    assert correction.role == "user"
+    assert problem in str(correction.parts)
+
+
+def test_extract_gives_up_after_max_attempts(client: FakeClient, agent: Agent) -> None:
+    client.models.generated = [reply(text('{"name": "Paul"}'))] * 2
+
+    with pytest.raises(
+        RuntimeError, match=r"(?s)within 2 attempt.*age: Field required"
+    ):
+        agent.extract("Who is the user?", Person, max_attempts=2)
+
+    assert len(client.models.generate_requests) == 2
+
+
+def test_extract_ignores_the_thoughts(client: FakeClient, agent: Agent) -> None:
+    thought = types.Part(text="The user said Paul.", thought=True)
+    client.models.generated = [reply(thought, text('{"name": "Paul", "age": 30}'))]
+
+    assert agent.extract("Who is the user?", Person).name == "Paul"
+
+
+@pytest.mark.parametrize(
+    "scripted",
+    [errors.APIError(503, {}), types.GenerateContentResponse(candidates=[])],
+    ids=["api-error", "no-candidates"],
+)
+def test_extract_does_not_retry_a_failed_request(
+    client: FakeClient,
+    agent: Agent,
+    scripted: types.GenerateContentResponse | Exception,
+) -> None:
+    client.models.generated = [scripted]
+
+    with pytest.raises(RuntimeError, match="Gemini"):
+        agent.extract("Who is the user?", Person)
+
+    assert len(client.models.generate_requests) == 1
+
+
+def test_extract_rejects_invalid_max_attempts(agent: Agent) -> None:
+    with pytest.raises(ValueError, match="max_attempts must be at least 1"):
+        agent.extract("Who is the user?", Person, max_attempts=0)
