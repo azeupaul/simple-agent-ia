@@ -15,6 +15,7 @@ A learning project to understand how an AI agent works by building one **without
 - Conversation size in tokens with `/tokens`
 - History summarization: beyond a token threshold, the older turns are replaced by a summary
 - Structured output: information extracted from the conversation as validated Pydantic objects, such as the task list of `/tasks`, with the model fixing its own invalid replies
+- Planning with `/plan`: the request is split into steps, approved by the user, then run one step at a time
 - Human confirmation: sensitive tools run only after the user approves the exact call
 
 ### Available tools
@@ -43,6 +44,7 @@ The model never runs anything itself: it only **requests** a tool, based on the 
 | `agent.py` | `Agent`: keeps the history, calls Gemini, runs the requested tools |
 | `tools.py` | `Tool` base class, `@tool` decorator, `ToolRegistry` and the concrete tools |
 | `tasks.py` | `Task` and `TaskList`, the Pydantic models of `/tasks` |
+| `planning.py` | `Step` and `Plan`, the Pydantic models of `/plan`, and the prompts that run a plan |
 | `main.py` | Configuration, the terminal chat loop and `Console`, which prints the streamed reply, traces and confirmations without mixing them |
 
 A turn is committed to the history only once it completes, so an API error or a `Ctrl+C` leaves the conversation unchanged.
@@ -134,6 +136,30 @@ With `/trace`, the tokens of each attempt and the rejected replies show:
     <-- 1260 tokens in, 48 out
 ```
 
+### Planning
+
+`/plan <request>` splits the request into steps before doing anything, shows the plan, and runs it only if the user approves it:
+
+```
+You: /plan What time is it in Tokyo and in Bafoussam, how many minutes are left before midnight in each city, and save the result in a note
+Plan: Give the time in Tokyo and Bafoussam, the minutes left before midnight, and save them in a note.
+  1. Get the current time in Tokyo with get_current_time.
+  2. Get the current time in Bafoussam with get_current_time.
+  3. Compute the minutes left before midnight in Tokyo and in Bafoussam.
+  4. Save the results in a note with write_note.
+Run this plan? [y/N] y
+[step 1/4] Get the current time in Tokyo with get_current_time.
+Agent: It is 08:57 in Tokyo.
+...
+[final answer]
+Agent: ...
+```
+
+- **Planning** is structured output: `Agent.plan()` calls `extract` with the `Plan` schema and its own instruction. The model sees the conversation and the list of tools, but no tool is declared in the request: it plans, it cannot act. A plan has at most 5 steps, a Pydantic constraint that the model is asked to fix if it goes beyond.
+- **Running** a plan adds nothing to the agent: each step is a normal turn of `chat_stream`, so tools, confirmations, tracing and summaries all work as usual. The message of each step repeats the whole plan and asks for that step only, so the model knows where it is even after a summary. A last turn asks for the final answer.
+
+Planning has a cost. On the request above, the plan took 11 model calls and about 12,600 input tokens, while the same request without a plan took 6 calls and about 4,000 tokens, for the same result: today's models already plan implicitly in their tool loop. An explicit plan pays off when it brings something the loop does not: a human review before the agent acts, long tasks where the model could lose its way, or replanning and delegating steps, which this version does not do.
+
 ### Confirmation of sensitive tools
 
 A tool marked `requires_confirmation` runs only if the user approves the exact call, arguments included:
@@ -175,6 +201,7 @@ The chat refuses to start if `MAX_CONTEXT_TOKENS` is not a positive integer.
 | `/trace` | Turn tracing of the agent loop on or off |
 | `/tokens` | Show the size of the conversation in tokens |
 | `/tasks` | List the tasks mentioned in the conversation, most urgent first |
+| `/plan <request>` | Plan the request, ask for approval, then run it step by step |
 | `/reset` | Start a new conversation |
 | `/quit`, `/exit`, `Ctrl+D` | Leave |
 | `Ctrl+C` | Cancel the current request, or leave at the prompt |
@@ -270,7 +297,7 @@ The tests never call Gemini: `tests/test_agent.py` replaces the client with a fa
   - [x] Streaming
   - [x] History summarization
   - [x] Structured output
-  - [ ] Planning
+  - [x] Planning
 
 ## Known limitations
 
@@ -278,6 +305,8 @@ The tests never call Gemini: `tests/test_agent.py` replaces the client with a fa
 - Note titles are case-sensitive on Linux: `Meeting` and `meeting` create two notes, while macOS and Windows treat them as the same file and refuse the second one.
 - The recent turns are kept by number, not by size. If they alone are beyond `MAX_CONTEXT_TOKENS`, for instance after a very long answer, a summary cannot bring the conversation back under it, and the agent summarizes again on every turn until that answer becomes an old turn.
 - Each summary of a summary can lose a little detail: what the model left out of the first summary is gone for good.
+- A plan is never revised: if a step fails or reveals something unexpected, the next steps run as planned. A failed step stops the plan, and the steps already done stay in the history.
+- The messages that run a plan's steps are stored in the history as user messages, although the user did not type them.
 
 ## License
 
