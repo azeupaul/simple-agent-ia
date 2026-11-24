@@ -1135,3 +1135,89 @@ def test_a_summary_reports_its_tokens(
 
     assert observer.events[-2:] == ["usage 300+20", "summarized 4, kept 6"]
     assert agent.context_tokens == 1300  # still the chat's last call
+
+
+# Planning
+
+PLAN_JSON = (
+    '{"goal": "Add 2 and 3", "steps": [{"description": "Add 2 and 3 with add"}]}'
+)
+
+
+def last_request_text(client: FakeClient) -> str:
+    """Return the text of the last message of the last non-streamed request."""
+    contents, _ = client.models.generate_requests[-1]
+    assert isinstance(contents, list)
+    return "".join(part.text or "" for part in contents[-1].parts or [])
+
+
+def test_plan_returns_a_validated_plan(client: FakeClient, agent: Agent) -> None:
+    client.models.generated = [reply(text(PLAN_JSON))]
+
+    plan = agent.plan("What is 2 + 3?")
+
+    assert plan.goal == "Add 2 and 3"
+    assert plan.lines() == ["1. Add 2 and 3 with add"]
+
+
+def test_plan_shows_the_tools_but_does_not_let_the_model_call_them(
+    client: FakeClient, agent: Agent
+) -> None:
+    client.models.generated = [reply(text(PLAN_JSON))]
+
+    agent.plan("What is 2 + 3?")
+
+    [(_, config)] = client.models.generate_requests
+    request = last_request_text(client)
+    assert "- add: Add two integers." in request
+    assert "- fail: Always fail." in request
+    assert "Request to plan: What is 2 + 3?" in request
+    assert config.system_instruction == Agent.PLAN_INSTRUCTION
+    assert config.tools is None
+
+
+def test_plan_without_tools(client: FakeClient) -> None:
+    agent = Agent(cast(genai.Client, client), model="fake-model")
+    client.models.generated = [reply(text(PLAN_JSON))]
+
+    agent.plan("What is 2 + 3?")
+
+    assert "Available tools:\n(none)" in last_request_text(client)
+
+
+def test_plan_does_not_change_the_history(client: FakeClient, agent: Agent) -> None:
+    client.models.generated = [reply(text(PLAN_JSON))]
+
+    agent.plan("What is 2 + 3?")
+
+    assert agent.history == ()
+
+
+def test_extract_uses_its_own_instruction_by_default(
+    client: FakeClient, agent: Agent
+) -> None:
+    client.models.generated = [reply(text('{"name": "Paul", "age": 30}'))]
+
+    agent.extract("Who is the user?", Person)
+
+    [(_, config)] = client.models.generate_requests
+    assert config.system_instruction == Agent.EXTRACT_INSTRUCTION
+
+
+def test_running_a_plan_is_a_series_of_normal_turns(
+    client: FakeClient, agent: Agent
+) -> None:
+    client.models.generated = [reply(text(PLAN_JSON))]
+    plan = agent.plan("What is 2 + 3?")
+    client.models.responses = [
+        reply(call("add", a=2, b=3)),
+        reply(text("2 + 3 = 5.")),
+        reply(text("The answer is 5.")),
+    ]
+
+    for index in range(1, len(plan.steps) + 1):
+        agent.chat(plan.step_prompt(index))
+    answer = agent.chat(plan.final_prompt())
+
+    assert answer == "The answer is 5."
+    assert Agent._turn_starts(agent.history) == [0, 4]  # step 1, then final answer

@@ -8,6 +8,7 @@ from google import genai
 from google.genai import types
 
 from agent import Agent, AgentObserver
+from planning import Plan
 from tasks import TaskList
 from tools import CalculateTool, get_current_time, write_note
 
@@ -17,6 +18,7 @@ HISTORY_COMMAND = "/history"
 TRACER_COMMAND = "/trace"
 TOKEN_COMMAND = "/tokens"
 TASKS_COMMAND = "/tasks"
+PLAN_COMMAND = "/plan"
 MAX_DISPLAY_LENGTH = 80
 
 
@@ -101,17 +103,20 @@ class Console:
         self.end_reply()
         print(text)
 
-    def confirm(self, call: types.FunctionCall) -> bool:
-        """Ask the user whether the model may run this tool call."""
-        self.line(f"The model wants to run {format_call(call)}")
-
+    def ask(self, question: str) -> bool:
+        """Ask a yes/no question. Anything but "y" or "yes" means no."""
         try:
-            answer = input("Allow it? [y/N] ")
+            answer = input(f"{question} [y/N] ")
         except EOFError:
             self.line("")
             return False
 
         return answer.strip().lower() in {"y", "yes"}
+
+    def confirm(self, call: types.FunctionCall) -> bool:
+        """Ask the user whether the model may run this tool call."""
+        self.line(f"The model wants to run {format_call(call)}")
+        return self.ask("Allow it?")
 
 
 class ConsoleTracer(AgentObserver):
@@ -230,6 +235,38 @@ def show_tasks(agent: Agent, console: Console) -> None:
         console.line(f"  {line}")
 
 
+def run_plan(agent: Agent, console: Console, request: str) -> None:
+    """Plan the request, ask the user to approve the plan, then run it.
+
+    Each step is a normal turn of the conversation, so the model can call
+    tools, and sensitive tools still need confirmation.
+
+    Raises:
+        RuntimeError: If planning or a step fails. The steps already done
+            stay in the history.
+    """
+    plan: Plan = agent.plan(request)
+
+    console.line(f"Plan: {plan.goal}")
+    for line in plan.lines():
+        console.line(f"  {line}")
+    if not console.ask("Run this plan?"):
+        console.line("[plan dropped]")
+        return
+
+    total = len(plan.steps)
+    for index, step in enumerate(plan.steps, start=1):
+        console.line(f"[step {index}/{total}] {step.description}")
+        for piece in agent.chat_stream(plan.step_prompt(index)):
+            console.reply(piece)
+        console.end_reply()
+
+    console.line("[final answer]")
+    for piece in agent.chat_stream(plan.final_prompt()):
+        console.reply(piece)
+    console.end_reply()
+
+
 def main() -> None:
     """Run an interactive chat session with the agent in the terminal."""
     load_dotenv()
@@ -254,6 +291,7 @@ def main() -> None:
     console.line(" - /trace to enable or disable traces")
     console.line(" - /tokens to show the size of the conversation in tokens")
     console.line(" - /tasks to list the tasks mentioned in the conversation")
+    console.line(" - /plan <request> to plan a request, then run it step by step")
     console.line(" - /reset to start a new conversation")
     console.line(" - /quit or /exit to end the session")
     console.line("Type your message and press Enter to send it.\n")
@@ -298,6 +336,20 @@ def main() -> None:
 
         if command == TASKS_COMMAND:
             show_tasks(agent, console)
+            continue
+
+        if command == PLAN_COMMAND:
+            console.line("Usage: /plan <request>")
+            continue
+
+        if command.startswith(f"{PLAN_COMMAND} "):
+            request = user_input[len(PLAN_COMMAND) :].strip()
+            try:
+                run_plan(agent, console, request)
+            except KeyboardInterrupt:
+                console.line("[plan cancelled]")
+            except RuntimeError as error:
+                console.line(f"[error] {error}")
             continue
 
         try:

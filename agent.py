@@ -8,6 +8,7 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, ValidationError
 
+from planning import Plan
 from tools import Tool, ToolRegistry
 
 
@@ -92,6 +93,14 @@ class Agent:
     )
 
     DEFAULT_MAX_EXTRACT_ATTEMPTS = 3
+
+    PLAN_INSTRUCTION = (
+        "You plan how an assistant will handle the user's request, before it "
+        "starts. Split the request into a few concrete steps, in order. Each "
+        "step must be doable with the assistant's tools, or by reasoning and "
+        "writing. Use the conversation as context. Never do the steps yourself: "
+        "only plan them. A simple request needs a single step."
+    )
 
     def __init__(
         self,
@@ -262,6 +271,7 @@ class Agent:
         schema: type[T],
         *,
         max_attempts: int = DEFAULT_MAX_EXTRACT_ATTEMPTS,
+        system_instruction: str = EXTRACT_INSTRUCTION,
     ) -> T:
         """Extract structured information from the conversation.
 
@@ -277,6 +287,8 @@ class Agent:
             instruction: What to extract, e.g. "List the tasks I mentioned."
             schema: The Pydantic model the reply must follow.
             max_attempts: Maximum number of requests, the first one included.
+            system_instruction: The instruction that frames the request.
+                Defaults to EXTRACT_INSTRUCTION.
 
         Returns:
             The validated reply, as an instance of the schema.
@@ -290,7 +302,7 @@ class Agent:
             raise ValueError(f"max_attempts must be at least 1, got {max_attempts}")
 
         config = types.GenerateContentConfig(
-            system_instruction=self.EXTRACT_INSTRUCTION,
+            system_instruction=system_instruction,
             response_mime_type="application/json",
             response_json_schema=schema.model_json_schema(),
         )
@@ -323,6 +335,33 @@ class Agent:
 
         raise RuntimeError(
             f"No valid reply within {max_attempts} attempt(s):\n{problems}"
+        )
+
+    def plan(self, request: str) -> Plan:
+        """Split a request into steps, without running them.
+
+        The model sees the conversation and the list of the agent's tools, but
+        cannot call them: it only plans. Run the plan by sending each
+        ``Plan.step_prompt`` to ``chat_stream``, then ``Plan.final_prompt``.
+
+        Args:
+            request: What the user wants done.
+
+        Returns:
+            The validated plan.
+
+        Raises:
+            RuntimeError: If a request fails, or if the model keeps returning
+                an invalid plan.
+        """
+        tools = "\n".join(
+            f"- {declaration.name}: {declaration.description}"
+            for declaration in self._tools.declarations
+        )
+        return self.extract(
+            f"Available tools:\n{tools or '(none)'}\n\nRequest to plan: {request}",
+            Plan,
+            system_instruction=self.PLAN_INSTRUCTION,
         )
 
     def _generate(
